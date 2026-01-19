@@ -210,19 +210,21 @@ class ScrapeRunner:
         from src.parse.html_parser import contains_location_vehicule
         from src.config import config
 
+        # Save the main nr (cto_nr) - never overwrite this!
+        cto_nr = nr
         start_time = time.time()
         
         try:
             # Check if already done (skip in DEV mode for fresh testing)
-            if not self.dev_mode and await self.state_db.is_done(nr):
+            if not self.dev_mode and await self.state_db.is_done(cto_nr):
                 self.metrics.increment("skipped")
                 return
 
             # Step 1: Fetch the main view page first for gating
-            view_url = f"{config.BASE_URL}/digi/com/cto/view?nr={nr}"
+            view_url = f"{config.BASE_URL}/digi/com/cto/view?nr={cto_nr}"
             
             if self.dev_mode:
-                logger.info(f"[DEV] Fetching view page for nr {nr}...")
+                logger.info(f"[DEV] Fetching view page for nr {cto_nr}...")
             
             async with FetchClient(cookie_only=self.cookie_only, login_only=self.login_only) as client:
                 view_response = await client.fetch(view_url)
@@ -230,7 +232,7 @@ class ScrapeRunner:
             # Check for errors
             if not view_response:
                 error_msg = "View page request failed"
-                await self.state_db.mark_failed(nr, error_msg)
+                await self.state_db.mark_failed(cto_nr, error_msg)
                 self.run_control.record_error()
                 self.metrics.increment("failed")
                 self.metrics.increment("processed")
@@ -240,12 +242,12 @@ class ScrapeRunner:
 
             # Check for 404
             if view_response.status_code == 404:
-                await self.state_db.mark_not_found(nr)
+                await self.state_db.mark_not_found(cto_nr)
                 self.metrics.increment("not_found")
                 self.metrics.increment("processed")
                 self.run_control.record_success()
                 if self.dev_mode:
-                    logger.info(f"[DEV] nr {nr}: NOT FOUND (404)")
+                    logger.info(f"[DEV] nr {cto_nr}: NOT FOUND (404)")
                 return
             
             # Check for 403/429 and record
@@ -261,15 +263,15 @@ class ScrapeRunner:
             gate_passed, gate_reason = contains_location_vehicule(html_content)
 
             if self.dev_mode:
-                logger.info(f"[DEV] nr {nr}: Gate {'PASSED' if gate_passed else 'FAILED'} (Location de véhicule)")
+                logger.info(f"[DEV] nr {cto_nr}: Gate {'PASSED' if gate_passed else 'FAILED'} (Location de véhicule)")
                 if not gate_passed:
                     logger.info(f"[DEV] Gate reason: {gate_reason.get('gate_reason', 'unknown')}")
 
             if not gate_passed:
                 # Gate failed - minimal record with gate_reason
-                logger.debug(f"Gate failed for nr {nr}, skipping full extraction")
+                logger.debug(f"Gate failed for nr {cto_nr}, skipping full extraction")
                 record_data = {
-                    "nr": nr,
+                    "nr": cto_nr,
                     "gate_passed": False,
                     "gate_reason": gate_reason.get("gate_reason", "unknown"),
                 }
@@ -285,7 +287,7 @@ class ScrapeRunner:
                 record_data = redact_json(record_data)
                 
                 record = SaleRecord(
-                    nr=nr,
+                    nr=cto_nr,
                     status="ok",
                     data=record_data,
                 )
@@ -293,7 +295,7 @@ class ScrapeRunner:
                 # Save to DEV storage (redacted)
                 if self.dev_storage:
                     self.dev_storage.save_nr_data(
-                        nr=nr,
+                        nr=cto_nr,
                         gate_passed=False,
                         urls_status={view_url: view_response.status_code},
                         extracted_data=record_data,
@@ -302,7 +304,7 @@ class ScrapeRunner:
                     )
                 
                 self.batch_buffer.append(record)
-                await self.state_db.mark_done(nr)
+                await self.state_db.mark_done(cto_nr)
                 self.metrics.increment("ok")
                 self.metrics.increment("processed")
                 self.metrics.increment("gate_failed")
@@ -315,12 +317,12 @@ class ScrapeRunner:
 
             # Step 3: Gate passed - record and fetch all 5 pages
             self.run_control.record_gated()
-            logger.debug(f"Gate passed for nr {nr}, fetching all pages")
-            urls = get_urls_for_nr(nr)  # Returns list[str] of URLs
+            logger.debug(f"Gate passed for nr {cto_nr}, fetching all pages")
+            urls = get_urls_for_nr(cto_nr)  # Returns list[str] of URLs
             
             if self.dev_mode:
                 page_types = [self._get_page_type_from_url(u) for u in urls]
-                logger.info(f"[DEV] nr {nr}: Crawling {len(urls)} URLs: {page_types}")
+                logger.info(f"[DEV] nr {cto_nr}: Crawling {len(urls)} URLs: {page_types}")
             
             async with FetchClient(cookie_only=self.cookie_only, login_only=self.login_only) as client:
                 responses = await client.fetch_all(urls)
@@ -366,16 +368,16 @@ class ScrapeRunner:
                 
                 # Build URLs for payment requests
                 for item in payment_requests_to_fetch:
-                    nr = item.get("nr")
-                    if nr:
-                        details_url = f"{config.BASE_URL}/digi/com/gocardless/viewPaymentRequestInfos?spaceSelect=1&nr={nr}"
+                    request_nr = item.get("nr")
+                    if request_nr:
+                        details_url = f"{config.BASE_URL}/digi/com/gocardless/viewPaymentRequestInfos?spaceSelect=1&nr={request_nr}"
                         detail_urls[details_url] = {"type": "gocardless", "item": item}
                 
                 # Build URLs for transactions
                 for item in transactions_to_fetch:
-                    nr = item.get("nr")
-                    if nr:
-                        details_url = f"{config.BASE_URL}/digi/cfg/modal/ajax/viewTransaction?nr={nr}"
+                    transaction_nr = item.get("nr")
+                    if transaction_nr:
+                        details_url = f"{config.BASE_URL}/digi/cfg/modal/ajax/viewTransaction?nr={transaction_nr}"
                         detail_urls[details_url] = {"type": "transaction", "item": item}
             
             # Fetch all detail pages in parallel if any
@@ -392,23 +394,33 @@ class ScrapeRunner:
                         for url, response in detail_responses.items():
                             url_info = detail_urls.get(url, {})
                             item = url_info.get("item", {})
-                            nr = item.get("nr", "?")
+                            detail_nr = item.get("nr", "?")
                             url_type = url_info.get("type", "?")
                             
                             if response and response.status_code == 200:
                                 bytes_size = len(response.text.encode("utf-8"))
-                                logger.info(f"[PAYMENT] fetching {url_type}_details nr={nr} -> {response.status_code} bytes={bytes_size}")
+                                logger.info(f"[PAYMENT] fetching {url_type}_details nr={detail_nr} -> {response.status_code} bytes={bytes_size}")
                             else:
                                 status_code = response.status_code if response else "no_response"
-                                logger.warning(f"[PAYMENT] fetching {url_type}_details nr={nr} -> {status_code}")
+                                logger.warning(f"[PAYMENT] fetching {url_type}_details nr={detail_nr} -> {status_code}")
                     
-                    # Store detail responses in html_responses for unified parsing
-                    for url, response in detail_responses.items():
-                        if response and response.status_code == 200:
-                            html_responses[url] = response.text
+                    # Store detail responses separately (don't mix with main pages)
+                    # We'll parse these separately in _parse_payment_details
+                    # Do NOT add them to html_responses as they would be treated as main pages
 
-            # Parse HTML pages - this will extract payment data from JSinfos spans
-            parsed_data = parse_html_pages(html_responses, config.BASE_URL, gate_passed=True, store_debug_snippets=self.dev_mode)
+            # Parse HTML pages - only parse the 5 main pages (not detail modals)
+            # html_responses should only contain the 5 main pages (view, payment, logistic, infos, orders)
+            # Filter out any detail modal URLs that might have been accidentally added
+            main_pages_responses = {
+                url: html_content 
+                for url, html_content in html_responses.items() 
+                if not any(keyword in url for keyword in [
+                    "/gocardless/viewPaymentRequestInfos", 
+                    "/modal/ajax/viewTransaction",
+                    "/cfg/modal/ajax/viewTransaction"
+                ])
+            }
+            parsed_data = parse_html_pages(main_pages_responses, config.BASE_URL, gate_passed=True, store_debug_snippets=self.dev_mode)
             
             # Process explorer links with enhanced filtering
             if self.store_explorer:
@@ -457,8 +469,9 @@ class ScrapeRunner:
 
             # Create full record (restructured, redacted)
             # Structure: nr, gate_passed, run_id, summary, pages, explorer_links_all
+            # Use cto_nr (never overwrite the main nr)
             data = {
-                "nr": nr,
+                "nr": cto_nr,
                 "gate_passed": True,
                 "run_id": self.run_id,
                 "summary": {
@@ -477,7 +490,7 @@ class ScrapeRunner:
             data = redact_json(data)
 
             record = SaleRecord(
-                nr=nr,
+                nr=cto_nr,
                 status="ok",
                 data=data,
             )
@@ -501,7 +514,7 @@ class ScrapeRunner:
                 elapsed = time.time() - start_time
                 
                 logger.info(
-                    f"[DEV] nr {nr}: Extraction complete - "
+                    f"[DEV] nr {cto_nr}: Extraction complete - "
                     f"JSinfos: {nb_jsinfos}, Basket lines: {nb_basket}, "
                     f"Semaine: {semaine}, Explorer links: {nb_explorer}, "
                     f"Payment requests: {nb_payment_requests}, Transactions: {nb_transactions}, "
@@ -509,7 +522,7 @@ class ScrapeRunner:
                 )
                 
                 self.dev_storage.save_nr_data(
-                    nr=nr,
+                    nr=cto_nr,
                     gate_passed=True,
                     urls_status=urls_status,
                     extracted_data=data,
@@ -524,23 +537,23 @@ class ScrapeRunner:
             if len(self.batch_buffer) >= config.BATCH_SIZE:
                 await self._flush_buffer()
 
-            # Mark as done
-            await self.state_db.mark_done(nr)
+            # Mark as done (use cto_nr)
+            await self.state_db.mark_done(cto_nr)
             self.metrics.increment("ok")
             self.metrics.increment("processed")
             self.metrics.increment("gate_passed")
             self.run_control.record_success()
-
+            
             # Report periodically
             if self.metrics.counters["processed"] % 100 == 0:
                 self.metrics.report()
 
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"Error processing nr {nr}: {error_msg}", exc_info=True)
+            logger.error(f"Error processing nr {cto_nr}: {error_msg}", exc_info=True)
             # Don't log cookies/tokens in error messages
             error_msg_redacted = redact_string(error_msg)
-            await self.state_db.mark_failed(nr, error_msg_redacted)
+            await self.state_db.mark_failed(cto_nr, error_msg_redacted)
             self.run_control.record_error()
             self.metrics.increment("failed")
             self.metrics.increment("processed")
@@ -599,27 +612,27 @@ class ScrapeRunner:
             response = detail_responses.get(details_url)
             url_type = url_info.get("type")
             item = url_info.get("item", {})
-            nr = item.get("nr")
+            detail_nr = item.get("nr")  # This is transaction_nr or payment_request_nr, NOT cto_nr
             
             if not response or response.status_code != 200:
                 # Log error but continue
                 if response and response.status_code in (302, 401, 403):
-                    logger.warning(f"[PAYMENT] Auth error for {url_type} details nr={nr}: {response.status_code}")
+                    logger.warning(f"[PAYMENT] Auth error for {url_type} details nr={detail_nr}: {response.status_code}")
                     item["fetch_error"] = f"auth_error_{response.status_code}"
                 elif response:
-                    logger.warning(f"[PAYMENT] HTTP error for {url_type} details nr={nr}: {response.status_code}")
+                    logger.warning(f"[PAYMENT] HTTP error for {url_type} details nr={detail_nr}: {response.status_code}")
                     item["fetch_error"] = f"http_error_{response.status_code}"
                 else:
-                    logger.warning(f"[PAYMENT] No response for {url_type} details nr={nr}")
+                    logger.warning(f"[PAYMENT] No response for {url_type} details nr={detail_nr}")
                     item["fetch_error"] = "no_response"
                 continue
             
             try:
                 html_content = response.text
-                if url_type == "gocardless" and nr:
+                if url_type == "gocardless" and detail_nr:
                     modal_data = parse_gocardless_modal(
                         html_content,
-                        nr,
+                        detail_nr,
                         details_url,
                     )
                     # Redact before storing
@@ -633,10 +646,10 @@ class ScrapeRunner:
                     payment_requests_enriched.append(enriched_item)
                     payment_request_fields_count += len(modal_data.get("raw_fields", {}))
                         
-                elif url_type == "transaction" and nr:
+                elif url_type == "transaction" and detail_nr:
                     modal_data = parse_transaction_modal(
                         html_content,
-                        nr,
+                        detail_nr,
                         details_url,
                     )
                     # Redact before storing
@@ -657,7 +670,7 @@ class ScrapeRunner:
                         
             except Exception as e:
                 error_msg = str(e)
-                logger.warning(f"[PAYMENT] Error parsing {url_type} details nr={nr}: {error_msg}")
+                logger.warning(f"[PAYMENT] Error parsing {url_type} details nr={detail_nr}: {error_msg}")
                 # Redact error message before storing
                 error_msg_redacted = redact_string(error_msg)
                 item["fetch_error"] = error_msg_redacted[:200]  # Truncate
