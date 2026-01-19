@@ -1,7 +1,6 @@
 """Extract explorer links from HTML pages."""
 import logging
 import re
-from typing import set
 from urllib.parse import urljoin, urlparse
 
 from selectolax.parser import HTMLParser

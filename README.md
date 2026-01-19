@@ -70,10 +70,16 @@ Exécuter le DDL fourni dans `supabase_schema.sql` dans votre projet Supabase.
 # Installer
 pip install -r requirements.txt
 
+# IMPORTANT: Si le login automatique ne fonctionne pas, utilisez un cookie manuel
+# Voir TROUBLESHOOTING.md pour extraire le cookie depuis votre navigateur
+
 # Tester un seul nr (dry-run, pas d'écriture Supabase)
 make dev
 # ou
 python -m src.main --nr 52000 --dev --dry-run
+
+# Avec cookie manuel (recommandé si login échoue)
+python -m src.main --nr 52000 --dev --dry-run --cookie-only
 
 # Tester une petite plage
 python -m src.main --start 52000 --end 52010 --dev
@@ -479,9 +485,20 @@ Le scraper affiche en temps réel :
 
 ## Troubleshooting
 
-### Session expirée
+### Session expirée / Login échoue
 
-Le scraper détecte automatiquement l'expiration et relance le login. Vérifier que `USERNAME`/`PASSWORD` sont corrects.
+**Si le login automatique échoue** (message "No session cookie found") :
+
+1. **Utiliser un cookie manuel** (recommandé) :
+   - Extraire le cookie `DigifactoryBO` depuis votre navigateur (F12 → Application → Cookies)
+   - Ajouter dans `.env` : `SESSION_COOKIE=DigifactoryBO=votre_valeur`
+   - Utiliser `--cookie-only` : `python -m src.main --nr 52000 --dev --dry-run --cookie-only`
+
+2. **Vérifier les credentials** : `USERNAME`/`PASSWORD` doivent être corrects
+
+3. **Vérifier l'URL de login** : `LOGIN_URL` doit pointer vers la bonne page
+
+Voir `TROUBLESHOOTING.md` pour plus de détails.
 
 ### Supabase timeout
 

@@ -31,6 +31,7 @@ class FetchClient:
             max_keepalive_connections=20,
         )
         
+        # httpx automatically manages cookies, but we can access them via client.cookies
         self.client = httpx.AsyncClient(
             http2=True,
             timeout=config.TIMEOUT,
@@ -76,6 +77,10 @@ class FetchClient:
                     # Retry once after re-auth
                     headers = {"Cookie": self.session_manager.get_cookie_header()}
                     response = await self.client.get(url, headers=headers, timeout=config.TIMEOUT)
+                    # Check again if still login page
+                    if is_login_page(response.text, response.status_code, str(response.url)):
+                        logger.error("Still on login page after relogin - authentication may have failed")
+                        raise RuntimeError("Authentication failed: still on login page after relogin")
                 else:
                     # Relogin failed
                     if self.session_manager._relogin_failed:

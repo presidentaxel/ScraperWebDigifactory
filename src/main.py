@@ -91,6 +91,24 @@ def parse_args() -> argparse.Namespace:
         default="on",
         help="Store explorer links (default: on if gate passes)",
     )
+    parser.add_argument(
+        "--dev-limit-payment",
+        type=int,
+        default=None,
+        help="DEV mode: limit to N payment requests for testing (default: all)",
+    )
+    parser.add_argument(
+        "--dev-limit-transaction",
+        type=int,
+        default=None,
+        help="DEV mode: limit to N transactions for testing (default: all)",
+    )
+    parser.add_argument(
+        "--dev-payment-limit",
+        type=int,
+        default=None,
+        help="DEV mode: alias for --dev-limit-payment",
+    )
     
     # Run control flags
     parser.add_argument(
@@ -269,6 +287,8 @@ def main() -> None:
         fail_fast=args.fail_fast,
         cookie_only=args.cookie_only,
         login_only=args.login_only,
+        dev_limit_payment=(args.dev_limit_payment or args.dev_payment_limit) if is_dev else None,
+        dev_limit_transaction=args.dev_limit_transaction if is_dev else None,
     )
     try:
         asyncio.run(runner.run())

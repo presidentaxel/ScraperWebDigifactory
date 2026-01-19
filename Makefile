@@ -4,6 +4,9 @@
 dev:
 	python -m src.main --nr 52000 --dev --dry-run
 
+dev-nr:
+	@python -m src.main --nr $(NR) --dev --dry-run
+
 dev-range:
 	python -m src.main --start 52000 --end 52010 --dev
 

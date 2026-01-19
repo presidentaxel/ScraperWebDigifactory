@@ -47,6 +47,8 @@ class ScrapeRunner:
         fail_fast: bool = False,
         cookie_only: bool = False,
         login_only: bool = False,
+        dev_limit_payment: Optional[int] = None,
+        dev_limit_transaction: Optional[int] = None,
     ):
         self.start = start
         self.end = end
@@ -60,6 +62,8 @@ class ScrapeRunner:
         self.explorer_max_links = explorer_max_links
         self.cookie_only = cookie_only
         self.login_only = login_only
+        self.dev_limit_payment = dev_limit_payment
+        self.dev_limit_transaction = dev_limit_transaction
         
         # Generate run_id
         self.run_id = str(uuid.uuid4())
@@ -254,19 +258,29 @@ class ScrapeRunner:
 
             # Step 2: Check gate (Location de véhicule)
             html_content = view_response.text
-            gate_passed = contains_location_vehicule(html_content)
+            gate_passed, gate_reason = contains_location_vehicule(html_content)
 
             if self.dev_mode:
                 logger.info(f"[DEV] nr {nr}: Gate {'PASSED' if gate_passed else 'FAILED'} (Location de véhicule)")
+                if not gate_passed:
+                    logger.info(f"[DEV] Gate reason: {gate_reason.get('gate_reason', 'unknown')}")
 
             if not gate_passed:
-                # Gate failed - minimal record
+                # Gate failed - minimal record with gate_reason
                 logger.debug(f"Gate failed for nr {nr}, skipping full extraction")
                 record_data = {
                     "nr": nr,
                     "gate_passed": False,
-                    "reason": "Location de véhicule not found",
+                    "gate_reason": gate_reason.get("gate_reason", "unknown"),
                 }
+                
+                # Add dev-only fields
+                if self.dev_mode:
+                    if gate_reason.get("gate_match_count") is not None:
+                        record_data["gate_match_count"] = gate_reason["gate_match_count"]
+                    if gate_reason.get("gate_matched_text"):
+                        record_data["gate_matched_text"] = gate_reason["gate_matched_text"]
+                
                 # Redact before storing
                 record_data = redact_json(record_data)
                 
@@ -302,10 +316,11 @@ class ScrapeRunner:
             # Step 3: Gate passed - record and fetch all 5 pages
             self.run_control.record_gated()
             logger.debug(f"Gate passed for nr {nr}, fetching all pages")
-            urls = get_urls_for_nr(nr)
+            urls = get_urls_for_nr(nr)  # Returns list[str] of URLs
             
             if self.dev_mode:
-                logger.info(f"[DEV] nr {nr}: Crawling {len(urls)} URLs: {[self._get_page_type_from_url(u) for u in urls]}")
+                page_types = [self._get_page_type_from_url(u) for u in urls]
+                logger.info(f"[DEV] nr {nr}: Crawling {len(urls)} URLs: {page_types}")
             
             async with FetchClient(cookie_only=self.cookie_only, login_only=self.login_only) as client:
                 responses = await client.fetch_all(urls)
@@ -327,8 +342,73 @@ class ScrapeRunner:
                         "final_url": str(response.url),
                     }
 
-            # Filter data based on store flags
-            parsed_data = parse_html_pages(html_responses, config.BASE_URL, gate_passed=True)
+            # Extract payment requests and transactions from JSinfos spans (NEW METHOD)
+            payment_url = next((u for u in urls if "viewPayment" in u), None)
+            payment_html = html_responses.get(payment_url) if payment_url else None
+            detail_urls = {}
+            payment_requests_data = []
+            transactions_data = []
+            
+            if payment_html:
+                from src.parse.payment_details import extract_payment_data_from_jsinfos
+                payment_data = extract_payment_data_from_jsinfos(payment_html, config.BASE_URL)
+                
+                # Store raw data for later enrichment with modal details
+                payment_requests_data = payment_data.get("payment_requests", [])
+                transactions_data = payment_data.get("transactions", [])
+                
+                # Collect detail URLs to fetch (limit in DEV mode if flag set)
+                dev_limit_payment = getattr(self, 'dev_limit_payment', None) if self.dev_mode else None
+                payment_requests_to_fetch = payment_requests_data[:dev_limit_payment] if dev_limit_payment else payment_requests_data
+                
+                dev_limit_transaction = getattr(self, 'dev_limit_transaction', None) if self.dev_mode else None
+                transactions_to_fetch = transactions_data[:dev_limit_transaction] if dev_limit_transaction else transactions_data
+                
+                # Build URLs for payment requests
+                for item in payment_requests_to_fetch:
+                    nr = item.get("nr")
+                    if nr:
+                        details_url = f"{config.BASE_URL}/digi/com/gocardless/viewPaymentRequestInfos?spaceSelect=1&nr={nr}"
+                        detail_urls[details_url] = {"type": "gocardless", "item": item}
+                
+                # Build URLs for transactions
+                for item in transactions_to_fetch:
+                    nr = item.get("nr")
+                    if nr:
+                        details_url = f"{config.BASE_URL}/digi/cfg/modal/ajax/viewTransaction?nr={nr}"
+                        detail_urls[details_url] = {"type": "transaction", "item": item}
+            
+            # Fetch all detail pages in parallel if any
+            detail_responses = {}
+            if detail_urls:
+                if self.dev_mode:
+                    logger.info(f"[PAYMENT] Fetching {len(detail_urls)} detail modals...")
+                
+                async with FetchClient(cookie_only=self.cookie_only, login_only=self.login_only) as detail_client:
+                    detail_responses = await detail_client.fetch_all(detail_urls.keys())
+                    
+                    # Log fetch results in DEV mode
+                    if self.dev_mode:
+                        for url, response in detail_responses.items():
+                            url_info = detail_urls.get(url, {})
+                            item = url_info.get("item", {})
+                            nr = item.get("nr", "?")
+                            url_type = url_info.get("type", "?")
+                            
+                            if response and response.status_code == 200:
+                                bytes_size = len(response.text.encode("utf-8"))
+                                logger.info(f"[PAYMENT] fetching {url_type}_details nr={nr} -> {response.status_code} bytes={bytes_size}")
+                            else:
+                                status_code = response.status_code if response else "no_response"
+                                logger.warning(f"[PAYMENT] fetching {url_type}_details nr={nr} -> {status_code}")
+                    
+                    # Store detail responses in html_responses for unified parsing
+                    for url, response in detail_responses.items():
+                        if response and response.status_code == 200:
+                            html_responses[url] = response.text
+
+            # Parse HTML pages - this will extract payment data from JSinfos spans
+            parsed_data = parse_html_pages(html_responses, config.BASE_URL, gate_passed=True, store_debug_snippets=self.dev_mode)
             
             # Process explorer links with enhanced filtering
             if self.store_explorer:
@@ -365,13 +445,34 @@ class ScrapeRunner:
             for page_type, page_data in parsed_data.get("pages", {}).items():
                 if page_data.get("url") in page_results:
                     page_data.update(page_results[page_data["url"]])
+            
+            # Parse detailed payment data from already-fetched modal responses
+            await self._parse_payment_details(
+                parsed_data, 
+                detail_responses, 
+                detail_urls,
+                payment_requests_data,
+                transactions_data
+            )
 
-            # Create full record (redacted)
+            # Create full record (restructured, redacted)
+            # Structure: nr, gate_passed, run_id, summary, pages, explorer_links_all
             data = {
                 "nr": nr,
                 "gate_passed": True,
-                **parsed_data,
+                "run_id": self.run_id,
+                "summary": {
+                    "nb_pages": len(parsed_data.get("pages", {})),
+                    "nb_jsinfos": self._count_jsinfos(parsed_data),
+                    "nb_explorer_links": len(parsed_data.get("explorer_links_all", [])),
+                },
+                "pages": parsed_data.get("pages", {}),
             }
+            
+            # Add explorer_links_all if storing
+            if self.store_explorer and parsed_data.get("explorer_links_all"):
+                data["explorer_links_all"] = parsed_data["explorer_links_all"]
+            
             # Redact secrets before storing
             data = redact_json(data)
 
@@ -383,15 +484,28 @@ class ScrapeRunner:
 
             # Save to DEV storage
             if self.dev_storage:
+                view_page = parsed_data.get("pages", {}).get("view", {})
+                extracted = view_page.get("extracted", {})
+                basket = extracted.get("basket", {})
+                location = extracted.get("location", {})
+                
+                payment_page = parsed_data.get("pages", {}).get("payment", {})
+                payment_extracted = payment_page.get("extracted", {})
+                nb_payment_requests = len(payment_extracted.get("payment_requests", []))
+                nb_transactions = len(payment_extracted.get("transactions", []))
+                
                 nb_jsinfos = self._count_jsinfos(parsed_data)
-                nb_basket = len(parsed_data.get("basket_lines", []))
-                nb_explorer = len(parsed_data.get("explorer_links", []))
+                nb_basket = len(basket.get("basket_lines", []))
+                nb_explorer = len(parsed_data.get("explorer_links_all", []))
+                semaine = location.get("semaine", "N/A")
                 elapsed = time.time() - start_time
                 
                 logger.info(
                     f"[DEV] nr {nr}: Extraction complete - "
                     f"JSinfos: {nb_jsinfos}, Basket lines: {nb_basket}, "
-                    f"Explorer links: {nb_explorer}, Time: {elapsed:.2f}s"
+                    f"Semaine: {semaine}, Explorer links: {nb_explorer}, "
+                    f"Payment requests: {nb_payment_requests}, Transactions: {nb_transactions}, "
+                    f"Time: {elapsed:.2f}s"
                 )
                 
                 self.dev_storage.save_nr_data(
@@ -436,14 +550,138 @@ class ScrapeRunner:
                 raise
 
     def _count_jsinfos(self, data: dict) -> int:
-        """Count total JSinfos found."""
+        """Count total JSinfos found across all pages."""
         count = 0
-        jsinfos = data.get("jsinfos", {})
-        if isinstance(jsinfos, dict):
-            for page_jsinfos in jsinfos.values():
-                if isinstance(page_jsinfos, dict):
-                    count += len(page_jsinfos)
+        pages = data.get("pages", {})
+        for page_data in pages.values():
+            extracted = page_data.get("extracted", {})
+            if isinstance(extracted, dict):
+                jsinfos = extracted.get("jsinfos", {})
+                if isinstance(jsinfos, dict):
+                    count += len(jsinfos)
         return count
+
+    async def _parse_payment_details(
+        self, 
+        parsed_data: dict, 
+        detail_responses: dict,
+        detail_urls: dict,
+        payment_requests_data: list,
+        transactions_data: list
+    ) -> None:
+        """Parse detailed payment data from already-fetched modal responses."""
+        from src.parse.payment_details import (
+            parse_gocardless_modal,
+            parse_transaction_modal,
+        )
+        from src.parse.redact import redact_json, redact_string
+        
+        payment_page = parsed_data.get("pages", {}).get("payment", {})
+        if not payment_page:
+            return
+        
+        extracted = payment_page.get("extracted", {})
+        if not isinstance(extracted, dict):
+            return
+        
+        # Build map: nr -> item data
+        payment_requests_map = {item.get("nr"): item for item in payment_requests_data if item.get("nr")}
+        transactions_map = {item.get("nr"): item for item in transactions_data if item.get("nr")}
+        
+        # Parse all detail responses and enrich items
+        payment_requests_enriched = []
+        transactions_enriched = []
+        
+        payment_request_fields_count = 0
+        transaction_fields_count = 0
+        
+        for details_url, url_info in detail_urls.items():
+            response = detail_responses.get(details_url)
+            url_type = url_info.get("type")
+            item = url_info.get("item", {})
+            nr = item.get("nr")
+            
+            if not response or response.status_code != 200:
+                # Log error but continue
+                if response and response.status_code in (302, 401, 403):
+                    logger.warning(f"[PAYMENT] Auth error for {url_type} details nr={nr}: {response.status_code}")
+                    item["fetch_error"] = f"auth_error_{response.status_code}"
+                elif response:
+                    logger.warning(f"[PAYMENT] HTTP error for {url_type} details nr={nr}: {response.status_code}")
+                    item["fetch_error"] = f"http_error_{response.status_code}"
+                else:
+                    logger.warning(f"[PAYMENT] No response for {url_type} details nr={nr}")
+                    item["fetch_error"] = "no_response"
+                continue
+            
+            try:
+                html_content = response.text
+                if url_type == "gocardless" and nr:
+                    modal_data = parse_gocardless_modal(
+                        html_content,
+                        nr,
+                        details_url,
+                    )
+                    # Redact before storing
+                    modal_data = redact_json(modal_data)
+                    
+                    # Merge item data with modal details
+                    enriched_item = dict(item)  # Copy all fields from JSinfos
+                    enriched_item["details"] = modal_data.get("details", {})
+                    enriched_item["raw"] = modal_data.get("raw_fields", {})
+                    
+                    payment_requests_enriched.append(enriched_item)
+                    payment_request_fields_count += len(modal_data.get("raw_fields", {}))
+                        
+                elif url_type == "transaction" and nr:
+                    modal_data = parse_transaction_modal(
+                        html_content,
+                        nr,
+                        details_url,
+                    )
+                    # Redact before storing
+                    modal_data = redact_json(modal_data)
+                    
+                    # Merge item data with modal details
+                    enriched_item = dict(item)  # Copy all fields from JSinfos
+                    # Add structured modal fields
+                    for key in ["type", "method", "date", "amount", "currency", 
+                               "bank_account_label", "bank_account_href", 
+                               "transaction_id", "invoice_ref"]:
+                        if key in modal_data:
+                            enriched_item[key] = modal_data[key]
+                    enriched_item["raw"] = modal_data.get("raw_fields", {})
+                    
+                    transactions_enriched.append(enriched_item)
+                    transaction_fields_count += len(modal_data.get("raw_fields", {}))
+                        
+            except Exception as e:
+                error_msg = str(e)
+                logger.warning(f"[PAYMENT] Error parsing {url_type} details nr={nr}: {error_msg}")
+                # Redact error message before storing
+                error_msg_redacted = redact_string(error_msg)
+                item["fetch_error"] = error_msg_redacted[:200]  # Truncate
+        
+        # Log parsing results
+        if self.dev_mode:
+            logger.info(
+                f"[PAYMENT] parsed modal fields: "
+                f"transaction_fields={transaction_fields_count} "
+                f"payment_request_fields={payment_request_fields_count}"
+            )
+        
+        # Store enriched items (replace raw items with enriched ones)
+        if payment_requests_enriched:
+            extracted["payment_requests"] = payment_requests_enriched
+        elif payment_requests_data:
+            # If no modals were fetched, still store raw data
+            extracted["payment_requests"] = payment_requests_data
+        
+        if transactions_enriched:
+            extracted["transactions"] = transactions_enriched
+        elif transactions_data:
+            # If no modals were fetched, still store raw data
+            extracted["transactions"] = transactions_data
 
     def _get_page_type_from_url(self, url: str) -> str:
         """Extract page type from URL."""

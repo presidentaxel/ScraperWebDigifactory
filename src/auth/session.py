@@ -75,30 +75,110 @@ class SessionManager:
             raise ValueError("Either SESSION_COOKIE or USERNAME/PASSWORD must be provided")
 
         logger.info(f"Logging in as {config.USERNAME}...")
+        logger.debug(f"Login URL: {config.LOGIN_URL}")
 
         # Try to login - adjust form data based on actual DigiFactory login form
+        # Common field names for DigiFactory
         login_data = {
             "username": config.USERNAME,
             "password": config.PASSWORD,
         }
+        
+        # Also try alternative field names
+        # DigiFactory might use: login, email, user, etc.
 
         try:
             response = await self._login_request(login_data)
+            
             # Extract session cookie from response
+            # Method 1: Check response.cookies
+            session_cookie = None
             cookies = response.cookies
-            session_cookie = cookies.get("DigifactoryBO")
+            if cookies:
+                session_cookie = cookies.get("DigifactoryBO")
+                if not session_cookie:
+                    # Try case variations
+                    for key in cookies.keys():
+                        if key.lower() == "digifactorybo":
+                            session_cookie = cookies.get(key)
+                            break
+            
+            # Method 2: Extract from Set-Cookie headers
             if not session_cookie:
-                # Try to extract from Set-Cookie header
-                for cookie in response.headers.get_list("Set-Cookie", []):
-                    if "DigifactoryBO" in cookie:
-                        session_cookie = cookie.split("DigifactoryBO=")[1].split(";")[0]
-                        break
+                set_cookie_headers = response.headers.get_list("Set-Cookie")
+                if not set_cookie_headers:
+                    # Try get_list with different case
+                    set_cookie_headers = response.headers.get_list("set-cookie")
+                
+                for cookie_header in set_cookie_headers:
+                    if "DigifactoryBO" in cookie_header or "digifactorybo" in cookie_header.lower():
+                        # Extract cookie value
+                        parts = cookie_header.split(";")
+                        for part in parts:
+                            if "=" in part and ("DigifactoryBO" in part or "digifactorybo" in part.lower()):
+                                key_value = part.strip().split("=", 1)
+                                if len(key_value) == 2:
+                                    key, value = key_value
+                                    if key.lower() == "digifactorybo":
+                                        session_cookie = value
+                                        break
+                        if session_cookie:
+                            break
+            
+            # Method 3: Check client's cookie jar (httpx stores cookies automatically)
+            if not session_cookie:
+                # httpx client automatically stores cookies in its jar
+                try:
+                    # Access cookies from the client's cookie jar
+                    jar_cookies = self.client.cookies
+                    if jar_cookies:
+                        # Try to get the cookie directly by name (httpx.Cookies is dict-like)
+                        try:
+                            # httpx.Cookies can be accessed like a dict
+                            if hasattr(jar_cookies, 'get'):
+                                session_cookie = jar_cookies.get("DigifactoryBO")
+                            # Or iterate through all cookies
+                            if not session_cookie:
+                                # Try to access all cookies
+                                all_cookies = dict(jar_cookies) if hasattr(jar_cookies, '__iter__') else {}
+                                for name, value in all_cookies.items():
+                                    if "digifactorybo" in name.lower():
+                                        session_cookie = value
+                                        break
+                        except (KeyError, AttributeError, TypeError) as e:
+                            logger.debug(f"Error accessing cookie jar directly: {e}")
+                            
+                        # Alternative: try to extract from cookie jar's internal structure
+                        if not session_cookie and hasattr(jar_cookies, '_cookies'):
+                            # Access internal cookie storage
+                            for domain_cookies in jar_cookies._cookies.values():
+                                for path_cookies in domain_cookies.values():
+                                    for name, cookie_obj in path_cookies.items():
+                                        if "digifactorybo" in name.lower():
+                                            session_cookie = cookie_obj.value if hasattr(cookie_obj, 'value') else str(cookie_obj)
+                                            break
+                                    if session_cookie:
+                                        break
+                                if session_cookie:
+                                    break
+                except Exception as e:
+                    logger.debug(f"Error accessing cookie jar: {e}")
 
             if session_cookie:
                 self._session_cookie = f"DigifactoryBO={session_cookie}"
-                logger.info("Login successful")
+                logger.info("Login successful - session cookie obtained")
             else:
-                raise ValueError("No session cookie found in login response")
+                # Debug: log response details
+                logger.error("=" * 60)
+                logger.error("LOGIN FAILED: No session cookie found")
+                logger.error(f"Response status: {response.status_code}")
+                logger.error(f"Response URL: {response.url}")
+                logger.error(f"Response cookies: {dict(cookies) if cookies else 'None'}")
+                logger.error(f"Set-Cookie headers: {response.headers.get_list('Set-Cookie')}")
+                logger.error("=" * 60)
+                logger.error("SOLUTION: Use --cookie-only with a manually extracted cookie")
+                logger.error("See TROUBLESHOOTING.md for instructions")
+                raise ValueError("No session cookie found in login response. Use --cookie-only with SESSION_COOKIE or check login URL/credentials.")
         except Exception as e:
             logger.error(f"Login failed: {e}")
             raise
@@ -110,6 +190,8 @@ class SessionManager:
     )
     async def _login_request(self, login_data: dict) -> httpx.Response:
         """Make login request with retries."""
+        # httpx client stores cookies automatically in its cookie jar
+        # We need to make sure cookies are enabled
         response = await self.client.post(
             config.LOGIN_URL,
             data=login_data,
@@ -117,6 +199,13 @@ class SessionManager:
             timeout=config.TIMEOUT,
         )
         response.raise_for_status()
+        
+        # Check if login was successful by examining the response
+        # If we're redirected away from login page, it's likely successful
+        final_url = str(response.url)
+        if "login" in final_url.lower():
+            logger.warning(f"Still on login page after POST: {final_url}")
+        
         return response
 
     async def _is_session_valid(self) -> bool:

@@ -60,52 +60,79 @@ def extract_numeric(text: str) -> float | None:
     return None
 
 
-def contains_location_vehicule(html_content: str) -> bool:
+def contains_location_vehicule(html_content: str) -> tuple[bool, dict[str, Any]]:
     """
     Check if HTML contains "Location de véhicule".
-    Returns True if at least one condition is met:
-    - Contains <h5>Location de véhicule</h5>
-    - Contains regex "Location\s+de\s+véhicule" (case-insensitive)
-    - Contains "Type de vente (code) = Location_Subscription"
+    Returns (bool, reason_dict) where reason_dict contains:
+    - gate_reason: reason code
+    - gate_matched_text: matched text (for dev)
+    - gate_match_count: number of matches
     """
     if not html_content:
-        return False
+        return False, {"gate_reason": "empty_html"}
 
     html_lower = html_content.lower()
+    matches = []
+    matched_texts = []
 
     # Check 1: <h5>Location de véhicule</h5>
     if "<h5>location de véhicule</h5>" in html_lower:
-        return True
+        matches.append("h5_tag")
+        matched_texts.append("<h5>Location de véhicule</h5>")
 
     # Check 2: Regex "Location\s+de\s+véhicule" (case-insensitive)
-    if re.search(r"location\s+de\s+véhicule", html_content, re.IGNORECASE):
-        return True
+    regex_match = re.search(r"location\s+de\s+véhicule", html_content, re.IGNORECASE)
+    if regex_match:
+        matches.append("regex")
+        matched_texts.append(regex_match.group(0))
 
     # Check 3: "Type de vente (code) = Location_Subscription"
     if "location_subscription" in html_lower or "type de vente" in html_lower:
-        # More specific check
-        if re.search(r"type\s+de\s+vente.*location[_-]?subscription", html_lower):
-            return True
+        type_match = re.search(r"type\s+de\s+vente.*location[_-]?subscription", html_lower)
+        if type_match:
+            matches.append("type_code")
+            matched_texts.append(type_match.group(0))
 
-    return False
+    if matches:
+        reason = {
+            "gate_reason": "location_de_vehicule_found",
+            "gate_match_count": len(matches),
+            "gate_matched_text": matched_texts[0] if matched_texts else None,  # First match for dev
+        }
+        return True, reason
+    else:
+        return False, {
+            "gate_reason": "missing_location_de_vehicule",
+            "gate_match_count": 0,
+        }
 
 
 def parse_html_pages(
     responses: dict[str, str | None],
     base_url: str,
     gate_passed: bool = True,
+    store_debug_snippets: bool = False,
 ) -> dict[str, Any]:
     """
     Parse all HTML pages and extract data.
     Only does full extraction if gate_passed is True.
     """
-    from src.parse.basket import extract_basket_lines
-    from src.parse.explorer import extract_explorer_links
+    from src.parse.explorer_enhanced import filter_and_tag_explorer_links
+    from src.parse.extractors.view_extractor import (
+        extract_basket_data,
+        extract_location_vehicule,
+        extract_sale_header,
+    )
+    from src.parse.extractors.tabs_extractors import (
+        extract_payment_data,
+        extract_logistic_data,
+        extract_infos_data,
+        extract_orders_data,
+    )
 
     data = {
         "pages": {},
-        "jsinfos": {},
-        "explorer_links": [],
+        "explorer_links_all": [],
     }
 
     # Parse each page
@@ -115,47 +142,102 @@ def parse_html_pages(
 
         page_type = _get_page_type(url)
         parser = HTMLParser(html_content)
+        content_length = len(html_content.encode("utf-8"))
 
         page_result = {
             "url": url,
             "status_code": 200,  # Will be set by caller if available
+            "final_url": url,  # Will be updated by caller
             "hash": _compute_hash(html_content),
+            "content_length": content_length,
+            "extracted": {},
         }
 
         # Only do full extraction if gate passed
         if gate_passed:
-            # Extract JSinfos from this page
+            # Extract JSinfos from this page (stored in extracted, not at root)
             page_jsinfos = parse_jsinfos(html_content)
             if page_jsinfos:
-                data["jsinfos"][page_type] = page_jsinfos
-                page_result["jsinfos"] = page_jsinfos
+                page_result["extracted"]["jsinfos"] = page_jsinfos
 
-            # Extract basket lines (only on view page)
+            # Extract data based on page type
             if page_type == "view":
-                basket_lines = extract_basket_lines(html_content)
-                if basket_lines:
-                    page_result["basket_lines"] = basket_lines
-                    data["basket_lines"] = basket_lines
+                # Extract basket data (with dev_mode for debug)
+                basket_data = extract_basket_data(html_content, dev_mode=store_debug_snippets)
+                # Always include basket data, even if empty (for debug info)
+                page_result["extracted"]["basket"] = basket_data
 
-            # Extract explorer links
-            explorer_links = extract_explorer_links(html_content, base_url)
+                # Extract location véhicule
+                location = extract_location_vehicule(html_content)
+                if location:
+                    page_result["extracted"]["location"] = location
+
+                # Extract sale header
+                sale_header = extract_sale_header(html_content)
+                if sale_header:
+                    page_result["extracted"]["sale_header"] = sale_header
+
+            elif page_type == "payment":
+                payment_data = extract_payment_data(html_content, base_url)
+                page_result["extracted"] = payment_data
+
+            elif page_type == "logistic":
+                logistic_data = extract_logistic_data(html_content)
+                page_result["extracted"] = logistic_data
+
+            elif page_type == "infos":
+                infos_data = extract_infos_data(html_content)
+                page_result["extracted"] = infos_data
+
+            elif page_type == "orders":
+                orders_data = extract_orders_data(html_content)
+                page_result["extracted"] = orders_data
+
+            # Extract explorer links (filtered and tagged)
+            explorer_links = filter_and_tag_explorer_links(html_content, base_url, max_links=200)
             if explorer_links:
                 page_result["explorer_links"] = explorer_links
-                data["explorer_links"].extend(explorer_links)
+                # Collect URLs for global deduplication
+                for link in explorer_links:
+                    if isinstance(link, dict) and "url" in link:
+                        data["explorer_links_all"].append(link["url"])
+                    elif isinstance(link, str):
+                        data["explorer_links_all"].append(link)
 
-            # Extract visible data
-            page_data = _extract_page_data(parser, page_type)
-            page_result.update(page_data)
+            # Extract debug snippets if requested (small, controlled)
+            if store_debug_snippets:
+                snippet = _extract_debug_snippet(html_content)
+                if snippet:
+                    page_result["extract_debug_snippet"] = snippet
         else:
             # Minimal extraction when gate not passed
-            page_result["gate_passed"] = False
+            page_result["extracted"] = {"gate_passed": False}
 
         data["pages"][page_type] = page_result
 
-    # Deduplicate explorer links
-    data["explorer_links"] = sorted(list(set(data["explorer_links"])))
+    # Deduplicate global explorer links
+    data["explorer_links_all"] = sorted(list(set(data["explorer_links_all"])))
 
     return data
+
+
+def _extract_debug_snippet(html_content: str, max_bytes: int = 3000) -> str | None:
+    """Extract a small debug snippet (max 3KB) for debugging."""
+    if not html_content:
+        return None
+    
+    # Extract first meaningful content (skip head, scripts, styles)
+    parser = HTMLParser(html_content)
+    body = parser.body
+    if not body:
+        return None
+    
+    # Get text content, limit size
+    snippet = body.text(separator=" ", strip=True)
+    if len(snippet.encode("utf-8")) > max_bytes:
+        snippet = snippet[:max_bytes] + "..."
+    
+    return snippet
 
 
 def _compute_hash(content: str) -> str:
@@ -253,11 +335,8 @@ def _extract_page_data(parser: HTMLParser, page_type: str) -> dict[str, Any]:
         if button_links:
             data["button_links"] = button_links
 
-    # Extract all text content for fallback (can be refined later)
-    # This ensures we don't lose data if selectors don't match
-    all_text = parser.body.text(separator="\n", strip=True)
-    if all_text:
-        data["_raw_text"] = all_text[:5000]  # Limit size
+    # NO _raw_text by default (too large and mostly menu)
+    # Use extract_debug_snippet if needed for debugging
 
     return data
 
