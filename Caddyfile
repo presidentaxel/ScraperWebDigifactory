@@ -1,0 +1,17 @@
+# Caddyfile for reverse proxy
+# Replace example.com with your domain
+
+example.com {
+    reverse_proxy scraper-api:8000
+    
+    # Optional: Basic auth
+    # basicauth {
+    #     user $2a$14$...
+    # }
+}
+
+# HTTP to HTTPS redirect
+http://example.com {
+    redir https://example.com{uri}
+}
+

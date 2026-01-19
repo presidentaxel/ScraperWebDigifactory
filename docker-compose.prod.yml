@@ -1,0 +1,51 @@
+version: '3.8'
+
+# Production docker-compose with reverse proxy
+services:
+  scraper-api:
+    build: .
+    container_name: digifactory-scraper-api
+    environment:
+      - BASE_URL=${BASE_URL}
+      - LOGIN_URL=${LOGIN_URL}
+      - USERNAME=${USERNAME}
+      - PASSWORD=${PASSWORD}
+      - SESSION_COOKIE=${SESSION_COOKIE}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE=${SUPABASE_SERVICE_ROLE}
+      - SUPABASE_TABLE=${SUPABASE_TABLE:-digifactory_sales}
+      - CONCURRENCY=${CONCURRENCY:-20}
+      - BATCH_SIZE=${BATCH_SIZE:-1000}
+      - RATE_PER_DOMAIN=${RATE_PER_DOMAIN:-2}
+      - TIMEOUT=${TIMEOUT:-20}
+      - MAX_RETRIES=${MAX_RETRIES:-5}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    networks:
+      - scraper-network
+
+  # Caddy reverse proxy (simple HTTPS)
+  caddy:
+    image: caddy:2-alpine
+    container_name: digifactory-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    networks:
+      - scraper-network
+
+networks:
+  scraper-network:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
+

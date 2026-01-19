@@ -1,0 +1,2 @@
+"""DigiFactory Scraper"""
+

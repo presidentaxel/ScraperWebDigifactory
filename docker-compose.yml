@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  scraper-api:
+    build: .
+    container_name: digifactory-scraper-api
+    ports:
+      - "8000:8000"
+    environment:
+      - BASE_URL=${BASE_URL:-https://entrepreneur.digifactory.fr}
+      - LOGIN_URL=${LOGIN_URL:-https://entrepreneur.digifactory.fr/digi/com/login}
+      - USERNAME=${USERNAME}
+      - PASSWORD=${PASSWORD}
+      - SESSION_COOKIE=${SESSION_COOKIE}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE=${SUPABASE_SERVICE_ROLE}
+      - SUPABASE_TABLE=${SUPABASE_TABLE:-digifactory_sales}
+      - CONCURRENCY=${CONCURRENCY:-20}
+      - BATCH_SIZE=${BATCH_SIZE:-1000}
+      - RATE_PER_DOMAIN=${RATE_PER_DOMAIN:-2}
+      - TIMEOUT=${TIMEOUT:-20}
+      - MAX_RETRIES=${MAX_RETRIES:-5}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Optional: Redis for queue (if needed)
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: digifactory-redis
+  #   ports:
+  #     - "6379:6379"
+  #   restart: unless-stopped
+
+  # Optional: Local Postgres (if not using Supabase)
+  # postgres:
+  #   image: postgres:15-alpine
+  #   container_name: digifactory-postgres
+  #   environment:
+  #     - POSTGRES_DB=${POSTGRES_DB:-digifactory}
+  #     - POSTGRES_USER=${POSTGRES_USER:-postgres}
+  #     - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+  #   restart: unless-stopped
+
+# volumes:
+#   postgres_data:
+
