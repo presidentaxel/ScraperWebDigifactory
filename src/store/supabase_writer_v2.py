@@ -25,6 +25,7 @@ class SupabaseWriterV2:
         )
         self.runs_table = "cto_runs"
         self.pages_table = "cto_pages"
+        self.errors_table = "cto_errors"
 
     async def upsert_run_and_pages(
         self,
@@ -36,11 +37,12 @@ class SupabaseWriterV2:
         from datetime import datetime
         
         # Prepare run data (redacted)
+        gate_passed = record.data.get("gate_passed", False)
         run_data = {
             "nr": record.nr,
             "run_id": run_id,
-            "gate_passed": record.data.get("gate_passed", False),
-            "gate_reason": record.data.get("reason"),
+            "gate_passed": gate_passed,
+            "gate_reason": record.data.get("gate_reason"),  # Fixed: was "reason", should be "gate_reason"
             "status": record.status,
             "started_at": record.fetched_at.isoformat(),
             "finished_at": datetime.utcnow().isoformat(),
@@ -53,8 +55,17 @@ class SupabaseWriterV2:
         pages_data = []
         pages = record.data.get("pages", {})
         
+        # Log warning if gate_passed but no pages (should not happen)
+        if gate_passed and not pages:
+            logger.warning(f"Run {run_id} (nr={record.nr}) has gate_passed=True but no pages data!")
+        
+        if not isinstance(pages, dict):
+            logger.warning(f"Run {run_id} (nr={record.nr}) has pages that is not a dict: {type(pages)}")
+            pages = {}
+        
         for page_type, page_info in pages.items():
             if not isinstance(page_info, dict):
+                logger.warning(f"Run {run_id} (nr={record.nr}) page {page_type} is not a dict: {type(page_info)}")
                 continue
             
             # Extract HTML if available and within limits
@@ -69,8 +80,9 @@ class SupabaseWriterV2:
                 # Remove from page_info before storing
                 page_info = {k: v for k, v in page_info.items() if k != "_html_content"}
             
-            # Redact extracted data
-            extracted = redact_json(page_info)
+            # Extract and redact only the "extracted" field, keep other fields intact
+            extracted_raw = page_info.get("extracted", {})
+            extracted = redact_json(extracted_raw) if extracted_raw else {}
             
             page_data = {
                 "run_id": run_id,
@@ -80,6 +92,7 @@ class SupabaseWriterV2:
                 "status_code": page_info.get("status_code"),
                 "final_url": page_info.get("final_url"),
                 "html_hash": page_info.get("hash"),
+                "content_length": page_info.get("content_length"),  # Add content_length if available
                 "extracted": extracted,
                 "raw_html_gz_b64": raw_html_gz_b64,
             }
@@ -91,9 +104,24 @@ class SupabaseWriterV2:
             await loop.run_in_executor(
                 None, self._upsert_sync, run_data, pages_data
             )
-            logger.info(f"Upserted run {run_id} (nr={record.nr}) with {len(pages_data)} pages")
+            if gate_passed and len(pages_data) == 0:
+                logger.warning(f"Upserted run {run_id} (nr={record.nr}) with gate_passed=True but 0 pages!")
+            else:
+                logger.info(f"Upserted run {run_id} (nr={record.nr}) with {len(pages_data)} pages")
         except Exception as e:
-            logger.error(f"Supabase upsert error: {e}")
+            logger.error(f"Supabase upsert error for run {run_id} (nr={record.nr}): {e}", exc_info=True)
+            # Log error to errors table
+            await self.log_error(
+                run_id=run_id,
+                error_type="supabase_error",
+                error_message=str(e)[:500],
+                error_details={
+                    "nr": record.nr,
+                    "gate_passed": record.data.get("gate_passed"),
+                    "pages_count": len(pages_data),
+                },
+                nr=record.nr,
+            )
             raise
 
     @retry(
@@ -103,20 +131,96 @@ class SupabaseWriterV2:
     )
     def _upsert_sync(self, run_data: dict, pages_data: list[dict]) -> None:
         """Synchronous upsert (called from thread pool)."""
+        nr = run_data.get("nr")
+        run_id = run_data.get("run_id")
+        gate_passed = run_data.get("gate_passed", False)
+        
         # Upsert run
-        (
-            self.client.table(self.runs_table)
-            .upsert(run_data, on_conflict="nr")
-            .execute()
-        )
+        try:
+            (
+                self.client.table(self.runs_table)
+                .upsert(run_data, on_conflict="nr")
+                .execute()
+            )
+        except Exception as e:
+            logger.error(f"Failed to upsert run nr={nr} run_id={run_id}: {e}", exc_info=True)
+            raise
+        
+        # Log if no pages but gate_passed
+        if gate_passed and len(pages_data) == 0:
+            logger.warning(f"Run nr={nr} run_id={run_id} has gate_passed=True but 0 pages to insert!")
         
         # Upsert pages (one by one due to unique constraint)
         for page_data in pages_data:
+            try:
+                (
+                    self.client.table(self.pages_table)
+                    .upsert(page_data, on_conflict="run_id,page_type")
+                    .execute()
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to upsert page run_id={page_data.get('run_id')} "
+                    f"page_type={page_data.get('page_type')} nr={page_data.get('nr')}: {e}",
+                    exc_info=True
+                )
+                # Note: Error logging will be done by the caller (upsert_run_and_pages)
+                raise
+
+    async def log_error(
+        self,
+        run_id: str,
+        error_type: str,
+        error_message: str,
+        error_details: Optional[dict] = None,
+        nr: Optional[int] = None,
+        page_type: Optional[str] = None,
+        url: Optional[str] = None,
+    ) -> None:
+        """Log an error to the cto_errors table."""
+        from datetime import datetime
+        from traceback import format_exc
+        
+        # Prepare error data
+        error_data = {
+            "run_id": run_id,
+            "nr": nr,
+            "error_type": error_type,
+            "error_message": error_message[:1000],  # Limit message length
+            "error_details": redact_json(error_details or {}),
+            "page_type": page_type,
+            "url": url,
+            "occurred_at": datetime.utcnow().isoformat(),
+        }
+        
+        # Add stack trace if available in error_details
+        if error_details and "traceback" not in error_details:
+            try:
+                error_data["error_details"]["traceback"] = format_exc()
+            except Exception:
+                pass
+        
+        # Insert error (non-blocking, don't fail if this fails)
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(
+                None, self._insert_error_sync, error_data
+            )
+        except Exception as e:
+            # Don't fail the main process if error logging fails
+            logger.warning(f"Failed to log error to Supabase: {e}")
+
+    def _insert_error_sync(self, error_data: dict) -> None:
+        """Synchronous error insert (called from thread pool)."""
+        try:
             (
-                self.client.table(self.pages_table)
-                .upsert(page_data, on_conflict="run_id,page_type")
+                self.client.table(self.errors_table)
+                .insert(error_data)
                 .execute()
             )
+        except Exception as e:
+            # Log but don't raise - error logging should never break the main flow
+            logger.warning(f"Failed to insert error log: {e}")
 
     async def test_connection(self) -> bool:
         """Test Supabase connection."""

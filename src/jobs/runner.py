@@ -233,6 +233,18 @@ class ScrapeRunner:
             if not view_response:
                 error_msg = "View page request failed"
                 await self.state_db.mark_failed(cto_nr, error_msg)
+                
+                # Log error to Supabase
+                if self.writer:
+                    await self.writer.log_error(
+                        run_id=self.run_id,
+                        error_type="fetch_error",
+                        error_message=error_msg,
+                        error_details={"nr": cto_nr, "url": view_url},
+                        nr=cto_nr,
+                        url=view_url,
+                    )
+                
                 self.run_control.record_error()
                 self.metrics.increment("failed")
                 self.metrics.increment("processed")
@@ -252,11 +264,35 @@ class ScrapeRunner:
             
             # Check for 403/429 and record
             if view_response.status_code == 403:
+                error_msg = "403 Forbidden - authentication failed"
                 self.run_control.record_error(status_code=403)
+                
+                # Log auth error to Supabase
+                if self.writer:
+                    await self.writer.log_error(
+                        run_id=self.run_id,
+                        error_type="auth_error",
+                        error_message=error_msg,
+                        error_details={"nr": cto_nr, "url": view_url, "status_code": 403},
+                        nr=cto_nr,
+                        url=view_url,
+                    )
+                
                 if self.run_control.fail_fast:
-                    raise RuntimeError("403 Forbidden - authentication failed")
+                    raise RuntimeError(error_msg)
             elif view_response.status_code == 429:
                 self.run_control.record_error(status_code=429)
+                
+                # Log rate limit error to Supabase
+                if self.writer:
+                    await self.writer.log_error(
+                        run_id=self.run_id,
+                        error_type="rate_limit_error",
+                        error_message="429 Too Many Requests",
+                        error_details={"nr": cto_nr, "url": view_url, "status_code": 429},
+                        nr=cto_nr,
+                        url=view_url,
+                    )
 
             # Step 2: Check gate (Location de véhicule)
             html_content = view_response.text
@@ -554,6 +590,30 @@ class ScrapeRunner:
             # Don't log cookies/tokens in error messages
             error_msg_redacted = redact_string(error_msg)
             await self.state_db.mark_failed(cto_nr, error_msg_redacted)
+            
+            # Log error to Supabase if writer is available
+            if self.writer:
+                import traceback
+                error_type = "processing_error"
+                if "auth" in error_msg.lower() or "login" in error_msg.lower():
+                    error_type = "auth_error"
+                elif "fetch" in error_msg.lower() or "http" in error_msg.lower():
+                    error_type = "fetch_error"
+                elif "parse" in error_msg.lower():
+                    error_type = "parse_error"
+                
+                await self.writer.log_error(
+                    run_id=self.run_id,
+                    error_type=error_type,
+                    error_message=error_msg_redacted[:500],
+                    error_details={
+                        "full_message": error_msg_redacted[:2000],
+                        "traceback": traceback.format_exc(),
+                        "nr": cto_nr,
+                    },
+                    nr=cto_nr,
+                )
+            
             self.run_control.record_error()
             self.metrics.increment("failed")
             self.metrics.increment("processed")
@@ -727,6 +787,14 @@ class ScrapeRunner:
         try:
             # Use new writer with 2-table schema
             for record in records:
+                # Log pages count before writing
+                pages_count = len(record.data.get("pages", {}))
+                gate_passed = record.data.get("gate_passed", False)
+                if gate_passed:
+                    logger.debug(f"Flushing record nr={record.nr} gate_passed={gate_passed} pages_count={pages_count}")
+                    if pages_count == 0:
+                        logger.warning(f"Record nr={record.nr} has gate_passed=True but pages_count=0!")
+                
                 await self.writer.upsert_run_and_pages(
                     self.run_id,
                     record,
@@ -735,7 +803,26 @@ class ScrapeRunner:
             # Delete spool file if it exists (from previous failed attempt)
             await self.spool.delete_batch(self.batch_id)
         except Exception as e:
-            logger.warning(f"Supabase write failed, spooling to disk: {e}")
+            logger.warning(f"Supabase write failed, spooling to disk: {e}", exc_info=True)
+            
+            # Log error to Supabase (if writer is still available)
+            if self.writer:
+                import traceback
+                try:
+                    await self.writer.log_error(
+                        run_id=self.run_id,
+                        error_type="supabase_write_error",
+                        error_message=str(e)[:500],
+                        error_details={
+                            "batch_id": self.batch_id,
+                            "records_count": len(records),
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                except Exception:
+                    # Don't fail if error logging itself fails
+                    pass
+            
             # Write to spool (redacted)
             for record in records:
                 # Redact before spooling

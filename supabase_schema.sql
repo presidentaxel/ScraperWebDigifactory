@@ -80,10 +80,42 @@ CREATE POLICY "Service role can manage cto_pages"
     FOR ALL
     USING (auth.role() = 'service_role');
 
+-- Table 3: cto_errors (error logs for debugging)
+CREATE TABLE IF NOT EXISTS cto_errors (
+    id BIGSERIAL PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    nr INTEGER,
+    error_type TEXT NOT NULL, -- fetch_error, parse_error, supabase_error, auth_error, etc.
+    error_message TEXT NOT NULL,
+    error_details JSONB, -- Stack trace, context, etc.
+    page_type TEXT, -- If error is related to a specific page
+    url TEXT, -- URL that caused the error
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Indexes for cto_errors
+CREATE INDEX IF NOT EXISTS idx_cto_errors_run_id ON cto_errors(run_id);
+CREATE INDEX IF NOT EXISTS idx_cto_errors_nr ON cto_errors(nr);
+CREATE INDEX IF NOT EXISTS idx_cto_errors_error_type ON cto_errors(error_type);
+CREATE INDEX IF NOT EXISTS idx_cto_errors_occurred_at ON cto_errors(occurred_at);
+
+-- Enable Row Level Security
+ALTER TABLE cto_errors ENABLE ROW LEVEL SECURITY;
+
+-- Policy to allow service role full access
+CREATE POLICY "Service role can manage cto_errors"
+    ON cto_errors
+    FOR ALL
+    USING (auth.role() = 'service_role');
+
 -- Comments
 COMMENT ON TABLE cto_runs IS 'Scraped DigiFactory sales runs (one per nr)';
 COMMENT ON TABLE cto_pages IS 'Scraped DigiFactory pages (one per page type per nr)';
+COMMENT ON TABLE cto_errors IS 'Error logs for debugging and monitoring';
 COMMENT ON COLUMN cto_runs.nr IS 'Sale number (primary key)';
 COMMENT ON COLUMN cto_runs.run_id IS 'Unique run identifier (UUID)';
 COMMENT ON COLUMN cto_runs.gate_passed IS 'Whether Location de véhicule was found';
 COMMENT ON COLUMN cto_pages.raw_html_gz_b64 IS 'Optional: gzip+base64 encoded HTML (max 1.5MB)';
+COMMENT ON COLUMN cto_errors.error_type IS 'Type of error: fetch_error, parse_error, supabase_error, auth_error, etc.';
+COMMENT ON COLUMN cto_errors.error_details IS 'JSONB with stack trace, context, and additional debugging info';
