@@ -156,9 +156,9 @@ class SupabaseWriterV2:
         run_id = run_data.get("run_id")
         gate_passed = run_data.get("gate_passed", False)
         
-        # CRITICAL: Delete ALL pages for this nr before inserting new ones
-        # The constraint is UNIQUE(run_id, page_type), but since all nr share the same run_id
-        # within a run, we need to delete by nr to prevent pages from different nr overwriting each other
+        # CRITICAL FIX: Delete ALL pages for this nr FIRST, then insert new ones
+        # The constraint UNIQUE(run_id, page_type) causes problems because all nr share the same run_id.
+        # Solution: delete by nr (which is unique per sale), then insert fresh pages.
         try:
             # Delete all pages for this nr (regardless of run_id)
             # This ensures each nr only has its own pages
@@ -168,15 +168,20 @@ class SupabaseWriterV2:
                 .eq("nr", nr)
                 .execute()
             )
+            # Supabase delete returns the deleted rows in response.data
             deleted_count = len(delete_response.data) if delete_response.data else 0
             if deleted_count > 0:
-                logger.debug(
-                    f"[SUPABASE_WRITE] Deleted {deleted_count} old pages for nr={nr} "
-                    f"before inserting new pages"
+                logger.info(
+                    f"[SUPABASE_WRITE] Deleted {deleted_count} existing pages for nr={nr} "
+                    f"(run_id={run_id}) before inserting {len(pages_data)} new pages"
                 )
+            elif len(pages_data) > 0:
+                logger.debug(f"[SUPABASE_WRITE] No existing pages to delete for nr={nr}, inserting {len(pages_data)} new pages")
         except Exception as e:
-            # Log but don't fail - deletion is best effort
-            logger.warning(f"[SUPABASE_WRITE] Failed to delete old pages for nr={nr}: {e}")
+            # CRITICAL: If deletion fails, we must fail the whole operation
+            # Otherwise we'll have duplicate pages or wrong data
+            logger.error(f"[SUPABASE_WRITE] CRITICAL: Failed to delete old pages for nr={nr}: {e}", exc_info=True)
+            raise RuntimeError(f"Failed to delete old pages for nr={nr} before insert: {e}")
         
         # Upsert run (this will overwrite previous run for this nr)
         try:
@@ -193,39 +198,112 @@ class SupabaseWriterV2:
         if gate_passed and len(pages_data) == 0:
             logger.warning(f"Run nr={nr} run_id={run_id} has gate_passed=True but 0 pages to insert!")
         
-        # Upsert pages (one by one due to unique constraint)
-        # Continue processing all pages even if one fails
-        successful_pages = 0
-        failed_pages = 0
-        for page_data in pages_data:
+        # Insert pages using upsert with the correct constraint
+        # After migration, the constraint will be (nr, page_type) instead of (run_id, page_type)
+        # For now, we delete and insert to work around the constraint issue
+        if pages_data:
             try:
+                # Try batch insert first
                 (
                     self.client.table(self.pages_table)
-                    .upsert(page_data, on_conflict="run_id,page_type")
+                    .insert(pages_data)  # Insert all pages in one operation
                     .execute()
                 )
-                successful_pages += 1
-            except Exception as e:
-                failed_pages += 1
-                logger.error(
-                    f"Failed to upsert page run_id={page_data.get('run_id')} "
-                    f"page_type={page_data.get('page_type')} nr={page_data.get('nr')}: {e}",
-                    exc_info=True
+                logger.debug(
+                    f"[SUPABASE_WRITE] Successfully batch-inserted {len(pages_data)} pages for nr={nr}"
                 )
-                # Continue processing other pages instead of raising
+            except Exception as e:
+                error_msg = str(e).lower()
+                # If constraint violation, it means the constraint is still (run_id, page_type)
+                # and we need to use upsert with the correct constraint after migration
+                if "unique" in error_msg or "duplicate" in error_msg:
+                    logger.warning(
+                        f"[SUPABASE_WRITE] Constraint violation detected for nr={nr}. "
+                        f"This suggests the unique constraint is still (run_id, page_type). "
+                        f"Please run migration_fix_unique_constraint.sql to fix this."
+                    )
+                    # Try upsert with (nr, page_type) - this will work after migration
+                    try:
+                        (
+                            self.client.table(self.pages_table)
+                            .upsert(pages_data, on_conflict="nr,page_type")
+                            .execute()
+                        )
+                        logger.info(
+                            f"[SUPABASE_WRITE] Used upsert with (nr, page_type) constraint for nr={nr}"
+                        )
+                    except Exception as e2:
+                        # Fallback: try one by one
+                        logger.error(
+                            f"[SUPABASE_WRITE] Upsert also failed, trying one by one: {e2}",
+                            exc_info=True
+                        )
+                        successful_pages = 0
+                        failed_pages = 0
+                        for page_data in pages_data:
+                            try:
+                                (
+                                    self.client.table(self.pages_table)
+                                    .upsert(page_data, on_conflict="nr,page_type")
+                                    .execute()
+                                )
+                                successful_pages += 1
+                            except Exception as e3:
+                                failed_pages += 1
+                                logger.error(
+                                    f"[SUPABASE_WRITE] Failed to upsert page page_type={page_data.get('page_type')} "
+                                    f"nr={page_data.get('nr')}: {e3}",
+                                    exc_info=True
+                                )
+                        
+                        if failed_pages > 0:
+                            raise RuntimeError(
+                                f"Failed to insert {failed_pages}/{len(pages_data)} pages for nr={nr}. "
+                                f"Success: {successful_pages}, Failed: {failed_pages}"
+                            )
+                else:
+                    # Other error - try one by one to identify the problem
+                    logger.error(
+                        f"[SUPABASE_WRITE] Batch insert failed for nr={nr}, trying one by one: {e}",
+                        exc_info=True
+                    )
+                    successful_pages = 0
+                    failed_pages = 0
+                    for page_data in pages_data:
+                        try:
+                            (
+                                self.client.table(self.pages_table)
+                                .insert(page_data)
+                                .execute()
+                            )
+                            successful_pages += 1
+                        except Exception as e2:
+                            failed_pages += 1
+                            logger.error(
+                                f"[SUPABASE_WRITE] Failed to insert page run_id={page_data.get('run_id')} "
+                                f"page_type={page_data.get('page_type')} nr={page_data.get('nr')}: {e2}",
+                                exc_info=True
+                            )
+                    
+                    if failed_pages > 0:
+                        raise RuntimeError(
+                            f"Failed to insert {failed_pages}/{len(pages_data)} pages for nr={nr}. "
+                            f"Success: {successful_pages}, Failed: {failed_pages}"
+                        )
         
-        # Log summary
-        if failed_pages > 0:
-            logger.warning(
-                f"[SUPABASE_WRITE] Upserted {successful_pages}/{len(pages_data)} pages for run_id={run_id} nr={nr}. "
-                f"{failed_pages} pages failed."
-            )
-        elif len(pages_data) > 0:
-            page_types_written = [p.get("page_type") for p in pages_data]
-            logger.info(
-                f"[SUPABASE_WRITE] Successfully upserted all {len(pages_data)} pages "
-                f"for run_id={run_id} nr={nr}: {page_types_written}"
-            )
+        # Log summary (only if we used one-by-one insert, batch insert logs separately)
+        if 'successful_pages' in locals() and 'failed_pages' in locals():
+            if failed_pages > 0:
+                logger.warning(
+                    f"[SUPABASE_WRITE] Inserted {successful_pages}/{len(pages_data)} pages for run_id={run_id} nr={nr}. "
+                    f"{failed_pages} pages failed."
+                )
+            elif len(pages_data) > 0:
+                page_types_written = [p.get("page_type") for p in pages_data]
+                logger.info(
+                    f"[SUPABASE_WRITE] Successfully inserted all {len(pages_data)} pages "
+                    f"for run_id={run_id} nr={nr}: {page_types_written}"
+                )
 
     async def log_error(
         self,
