@@ -5,6 +5,30 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def is_double_session_popup(response_html: str | None) -> bool:
+    """
+    Detect if response contains the "Double session" popup.
+    This happens when too many concurrent requests create multiple sessions.
+    """
+    if not response_html:
+        return False
+    
+    html_lower = response_html.lower()
+    
+    # Check for double session indicators
+    double_session_indicators = [
+        r'double session',
+        r'deuxième session.*active',
+        r'session en trop',
+        r'quittez et reconnectez',
+        r'fermer la session',
+    ]
+    
+    # Need at least 2 indicators to be sure
+    matches = sum(1 for pattern in double_session_indicators if re.search(pattern, html_lower, re.IGNORECASE))
+    return matches >= 2
+
+
 def is_login_page(
     response_html: str | None,
     status_code: int,
@@ -57,6 +81,10 @@ def is_login_page(
     
     count = sum(1 for indicator in weak_indicators if indicator in html_lower)
     if count >= 2:
+        return True
+    
+    # Check for double session popup (also requires re-authentication)
+    if is_double_session_popup(response_html):
         return True
     
     return False

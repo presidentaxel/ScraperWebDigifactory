@@ -68,6 +68,26 @@ class FetchClient:
         try:
             response = await self.client.get(url, headers=headers, timeout=config.TIMEOUT)
 
+            # Check for double session popup first (requires session reset)
+            from src.auth.login_detector import is_double_session_popup
+            if is_double_session_popup(response.text):
+                logger.warning(f"Detected 'Double session' popup for {url} - too many concurrent sessions")
+                logger.warning("Invalidating current session and re-authenticating...")
+                # Invalidate current session
+                self.session_manager._session_cookie = None
+                # Clear client cookies to force new session
+                self.client.cookies.clear()
+                # Re-authenticate
+                await self.session_manager.ensure_authenticated()
+                # Retry with new session
+                headers = {"Cookie": self.session_manager.get_cookie_header()}
+                response = await self.client.get(url, headers=headers, timeout=config.TIMEOUT)
+                # Check again if still double session (shouldn't happen but just in case)
+                if is_double_session_popup(response.text):
+                    logger.error("Still getting 'Double session' popup after re-authentication")
+                    logger.error("Consider reducing CONCURRENCY or RATE_PER_DOMAIN to avoid multiple sessions")
+                    raise RuntimeError("Double session popup persists after re-authentication - reduce concurrency")
+
             # Check for login page (using detector)
             from src.auth.login_detector import is_login_page
             if is_login_page(response.text, response.status_code, str(response.url)):

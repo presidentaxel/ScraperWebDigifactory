@@ -361,7 +361,7 @@ class ScrapeRunner:
             # Step 3: Gate passed - record and fetch all 5 pages
             self.run_control.record_gated()
             logger.debug(f"Gate passed for nr {cto_nr}, fetching all pages")
-            urls = get_urls_for_nr(cto_nr)  # Returns list[str] of URLs
+            urls = get_urls_for_nr(cto_nr)  # Returns list[str] of URLs (should be exactly 5)
             
             if self.dev_mode:
                 page_types = [self._get_page_type_from_url(u) for u in urls]
@@ -369,22 +369,38 @@ class ScrapeRunner:
             
             async with FetchClient(cookie_only=self.cookie_only, login_only=self.login_only) as client:
                 responses = await client.fetch_all(urls)
+            
+            # Verify all URLs are in responses (even if None due to fetch failure)
+            missing_urls = set(urls) - set(responses.keys())
+            if missing_urls:
+                logger.warning(f"nr {cto_nr}: Some URLs missing from fetch_all response: {missing_urls}")
+                # Add missing URLs as None to ensure they're processed
+                for url in missing_urls:
+                    responses[url] = None
 
             # Parse HTML with full extraction
-            html_responses = {
-                url: (r.text if r else None) for url, r in responses.items()
-            }
-            
-            # Add status codes and final URLs
+            # IMPORTANT: Include ALL URLs in html_responses, even if fetch failed (None)
+            # This ensures parse_html_pages creates entries for all pages
+            html_responses = {}
             urls_status = {}
             page_results = {}
             for url, response in responses.items():
+                # Always add URL to html_responses, even if response is None
+                html_responses[url] = response.text if response else None
+                
                 if response:
                     status = response.status_code
                     urls_status[url] = status
                     page_results[url] = {
                         "status_code": status,
                         "final_url": str(response.url),
+                    }
+                else:
+                    # Track failed fetches
+                    urls_status[url] = None
+                    page_results[url] = {
+                        "status_code": None,
+                        "final_url": url,
                     }
 
             # Extract payment requests and transactions from JSinfos spans (NEW METHOD)
@@ -454,6 +470,7 @@ class ScrapeRunner:
             # Parse HTML pages - only parse the 5 main pages (not detail modals)
             # html_responses should only contain the 5 main pages (view, payment, logistic, infos, orders)
             # Filter out any detail modal URLs that might have been accidentally added
+            # IMPORTANT: Keep ALL main pages, even if html_content is None (failed fetch)
             main_pages_responses = {
                 url: html_content 
                 for url, html_content in html_responses.items() 
@@ -464,24 +481,41 @@ class ScrapeRunner:
                 ])
             }
             
-            # Log pages being parsed
+            # Log pages being parsed (including failed ones)
             if self.dev_mode:
                 logger.debug(f"[DEV] nr {cto_nr}: Parsing {len(main_pages_responses)} main pages")
-                for url in main_pages_responses.keys():
+                for url, html_content in main_pages_responses.items():
                     page_type = self._get_page_type_from_url(url)
-                    logger.debug(f"[DEV]   - {page_type}: {url}")
+                    status = "OK" if html_content else "FAILED"
+                    logger.debug(f"[DEV]   - {page_type}: {url} [{status}]")
             
             parsed_data = parse_html_pages(main_pages_responses, config.BASE_URL, gate_passed=True, store_debug_snippets=self.dev_mode)
             
             # Log parsed pages
             parsed_pages = parsed_data.get("pages", {})
+            
+            # Verify all expected pages are present (even if they failed to fetch)
+            expected_page_types = {"view", "payment", "logistic", "infos", "orders"}
+            actual_page_types = set(parsed_pages.keys())
+            missing_page_types = expected_page_types - actual_page_types
+            
+            if missing_page_types:
+                logger.warning(
+                    f"nr {cto_nr}: Missing page types in parsed_data: {missing_page_types}. "
+                    f"Expected: {expected_page_types}, Got: {actual_page_types}"
+                )
+            
             if self.dev_mode:
                 logger.debug(f"[DEV] nr {cto_nr}: Parsed {len(parsed_pages)} pages: {list(parsed_pages.keys())}")
+                if missing_page_types:
+                    logger.warning(f"[DEV] nr {cto_nr}: Missing pages: {missing_page_types}")
             
             # Process explorer links with enhanced filtering
             if self.store_explorer:
                 for page_type, page_data in parsed_data.get("pages", {}).items():
-                    html_content = html_responses.get(page_data.get("url", ""))
+                    # Use main_pages_responses to get HTML (consistent with what was parsed)
+                    page_url = page_data.get("url", "")
+                    html_content = main_pages_responses.get(page_url)
                     if html_content:
                         explorer_links = filter_and_tag_explorer_links(
                             html_content,
@@ -501,18 +535,24 @@ class ScrapeRunner:
                     page_data.pop("jsinfos", None)
             
             # Store HTML content temporarily for writer (if within limits)
+            # Use main_pages_responses to get HTML (consistent with what was parsed)
             for page_type, page_data in parsed_data.get("pages", {}).items():
                 url = page_data.get("url", "")
-                html_content = html_responses.get(url)
+                html_content = main_pages_responses.get(url)
                 if html_content and self.store_html:
                     html_bytes = len(html_content.encode("utf-8"))
                     if html_bytes <= self.max_html_bytes:
                         page_data["_html_content"] = html_content
             
-            # Merge page results
+            # Merge page results (status_code, final_url) for ALL pages
+            # This ensures even failed pages get their status_code recorded
             for page_type, page_data in parsed_data.get("pages", {}).items():
-                if page_data.get("url") in page_results:
-                    page_data.update(page_results[page_data["url"]])
+                page_url = page_data.get("url")
+                if page_url in page_results:
+                    page_data.update(page_results[page_url])
+                else:
+                    # Log warning if URL not found in page_results (should not happen)
+                    logger.warning(f"Page {page_type} URL {page_url} not found in page_results for nr {cto_nr}")
             
             # Parse detailed payment data from already-fetched modal responses
             await self._parse_payment_details(

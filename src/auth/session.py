@@ -36,6 +36,23 @@ class SessionManager:
         Check if response indicates login needed, and relogin if so.
         Returns True if relogin was attempted and succeeded.
         """
+        # Check for double session popup first
+        from src.auth.login_detector import is_double_session_popup
+        if is_double_session_popup(response.text):
+            logger.warning("Detected 'Double session' popup, resetting session...")
+            # Invalidate current session
+            self._session_cookie = None
+            # Clear client cookies
+            self.client.cookies.clear()
+            try:
+                await self.login()
+                self._relogin_failed = False
+                return True
+            except Exception as e:
+                logger.error(f"Relogin after double session failed: {e}")
+                self._relogin_failed = True
+                return False
+        
         # Check if it's a login page
         if is_login_page(response.text, response.status_code, str(response.url)):
             logger.warning("Detected login page, attempting relogin...")

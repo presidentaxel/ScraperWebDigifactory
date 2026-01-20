@@ -137,10 +137,38 @@ def parse_html_pages(
 
     # Parse each page
     for url, html_content in responses.items():
+        page_type = _get_page_type(url)
+        
+        # Create page result even if html_content is None (failed fetch)
+        # This ensures all pages are recorded in Supabase even if they failed
         if not html_content:
+            # Page failed to fetch - create minimal entry
+            page_result = {
+                "url": url,
+                "status_code": None,  # Will be set by caller if available
+                "final_url": url,  # Will be updated by caller
+                "hash": None,
+                "content_length": 0,
+                "extracted": {"fetch_error": "no_html_content"},
+            }
+            data["pages"][page_type] = page_result
             continue
 
-        page_type = _get_page_type(url)
+        # Check for double session popup - this is not valid page content
+        from src.auth.login_detector import is_double_session_popup
+        if is_double_session_popup(html_content):
+            # Page contains double session popup - mark as error
+            page_result = {
+                "url": url,
+                "status_code": 200,  # HTTP 200 but content is popup
+                "final_url": url,
+                "hash": _compute_hash(html_content),
+                "content_length": len(html_content.encode("utf-8")),
+                "extracted": {"fetch_error": "double_session_popup"},
+            }
+            data["pages"][page_type] = page_result
+            continue
+
         parser = HTMLParser(html_content)
         content_length = len(html_content.encode("utf-8"))
 
