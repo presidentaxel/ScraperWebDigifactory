@@ -63,6 +63,11 @@ class SupabaseWriterV2:
             logger.warning(f"Run {run_id} (nr={record.nr}) has pages that is not a dict: {type(pages)}")
             pages = {}
         
+        # Log pages being processed
+        if gate_passed and pages:
+            page_types = list(pages.keys())
+            logger.debug(f"Preparing {len(page_types)} pages for run_id={run_id} nr={record.nr}: {page_types}")
+        
         for page_type, page_info in pages.items():
             if not isinstance(page_info, dict):
                 logger.warning(f"Run {run_id} (nr={record.nr}) page {page_type} is not a dict: {type(page_info)}")
@@ -106,8 +111,11 @@ class SupabaseWriterV2:
             )
             if gate_passed and len(pages_data) == 0:
                 logger.warning(f"Upserted run {run_id} (nr={record.nr}) with gate_passed=True but 0 pages!")
+            elif gate_passed:
+                page_types = [p.get("page_type") for p in pages_data]
+                logger.info(f"Upserted run {run_id} (nr={record.nr}) with {len(pages_data)} pages: {page_types}")
             else:
-                logger.info(f"Upserted run {run_id} (nr={record.nr}) with {len(pages_data)} pages")
+                logger.debug(f"Upserted run {run_id} (nr={record.nr}) with gate_passed=False (no pages)")
         except Exception as e:
             logger.error(f"Supabase upsert error for run {run_id} (nr={record.nr}): {e}", exc_info=True)
             # Log error to errors table
@@ -151,6 +159,9 @@ class SupabaseWriterV2:
             logger.warning(f"Run nr={nr} run_id={run_id} has gate_passed=True but 0 pages to insert!")
         
         # Upsert pages (one by one due to unique constraint)
+        # Continue processing all pages even if one fails
+        successful_pages = 0
+        failed_pages = 0
         for page_data in pages_data:
             try:
                 (
@@ -158,14 +169,26 @@ class SupabaseWriterV2:
                     .upsert(page_data, on_conflict="run_id,page_type")
                     .execute()
                 )
+                successful_pages += 1
             except Exception as e:
+                failed_pages += 1
                 logger.error(
                     f"Failed to upsert page run_id={page_data.get('run_id')} "
                     f"page_type={page_data.get('page_type')} nr={page_data.get('nr')}: {e}",
                     exc_info=True
                 )
-                # Note: Error logging will be done by the caller (upsert_run_and_pages)
-                raise
+                # Continue processing other pages instead of raising
+        
+        # Log summary
+        if failed_pages > 0:
+            logger.warning(
+                f"Upserted {successful_pages}/{len(pages_data)} pages for run_id={run_id} nr={nr}. "
+                f"{failed_pages} pages failed."
+            )
+        elif len(pages_data) > 0:
+            logger.debug(
+                f"Successfully upserted all {len(pages_data)} pages for run_id={run_id} nr={nr}"
+            )
 
     async def log_error(
         self,

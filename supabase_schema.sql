@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS cto_pages (
     status_code INTEGER,
     final_url TEXT,
     html_hash TEXT,
+    content_length INTEGER, -- Size of HTML content in bytes
     extracted JSONB NOT NULL DEFAULT '{}'::jsonb,
     raw_html_gz_b64 TEXT, -- Optional: gzip+base64 encoded HTML (controlled size)
     created_at TIMESTAMPTZ DEFAULT NOW(),

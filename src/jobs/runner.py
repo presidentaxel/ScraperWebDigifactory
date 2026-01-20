@@ -119,10 +119,13 @@ class ScrapeRunner:
         # Get list of nr to process
         if self.resume:
             nrs = await self.state_db.get_next_undone(self.start, self.end)
-            logger.info(f"Resuming: {len(nrs)} remaining records")
+            if nrs:
+                logger.info(f"Resuming: {len(nrs)} remaining records (first: {nrs[0]}, last: {nrs[-1]})")
+            else:
+                logger.info(f"Resuming: All records between {self.start} and {self.end} are already done")
         else:
             nrs = list(range(self.start, self.end + 1))
-            logger.info(f"Starting fresh: {len(nrs)} records")
+            logger.info(f"Starting fresh: {len(nrs)} records (first: {nrs[0]}, last: {nrs[-1]})")
 
         # Process with concurrency
         semaphore = asyncio.Semaphore(config.CONCURRENCY)
@@ -456,7 +459,20 @@ class ScrapeRunner:
                     "/cfg/modal/ajax/viewTransaction"
                 ])
             }
+            
+            # Log pages being parsed
+            if self.dev_mode:
+                logger.debug(f"[DEV] nr {cto_nr}: Parsing {len(main_pages_responses)} main pages")
+                for url in main_pages_responses.keys():
+                    page_type = self._get_page_type_from_url(url)
+                    logger.debug(f"[DEV]   - {page_type}: {url}")
+            
             parsed_data = parse_html_pages(main_pages_responses, config.BASE_URL, gate_passed=True, store_debug_snippets=self.dev_mode)
+            
+            # Log parsed pages
+            parsed_pages = parsed_data.get("pages", {})
+            if self.dev_mode:
+                logger.debug(f"[DEV] nr {cto_nr}: Parsed {len(parsed_pages)} pages: {list(parsed_pages.keys())}")
             
             # Process explorer links with enhanced filtering
             if self.store_explorer:
