@@ -172,10 +172,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=f"Concurrency level (default: {config.CONCURRENCY})",
     )
-    parser.add_argument(
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument(
         "--resume",
         action="store_true",
+        dest="resume",
+        default=None,
         help="Resume from last checkpoint (default in PROD)",
+    )
+    resume_group.add_argument(
+        "--no-resume",
+        action="store_false",
+        dest="resume",
+        help="Force fresh start, ignore checkpoint (overrides PROD default)",
     )
     parser.add_argument(
         "--batch-size",
@@ -212,15 +221,15 @@ def main() -> None:
         if args.batch_size is None:
             config.BATCH_SIZE = 10
         config.RATE_PER_DOMAIN = 0.5
-        # Resume disabled in DEV by default
-        if not args.resume:
+        # Resume disabled in DEV by default (only if not explicitly set)
+        if args.resume is None:
             args.resume = False
         # Set log level to DEBUG for verbose output
         import logging
         logging.getLogger().setLevel(logging.DEBUG)
     else:
-        # PROD mode: resume by default
-        if not args.resume:
+        # PROD mode: resume by default (only if not explicitly set)
+        if args.resume is None:
             args.resume = True
 
     # Determine range
