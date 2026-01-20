@@ -626,6 +626,14 @@ class ScrapeRunner:
                     store_html=self.store_html,
                 )
 
+            # Log pages before adding to buffer
+            pages_count = len(parsed_data.get("pages", {}))
+            page_types = list(parsed_data.get("pages", {}).keys())
+            logger.info(
+                f"[GATE_PASSED] nr {cto_nr}: Parsed {pages_count} pages: {page_types}. "
+                f"Adding to buffer (buffer_size={len(self.batch_buffer) + 1}/{config.BATCH_SIZE})"
+            )
+            
             # Add to buffer
             self.batch_buffer.append(record)
 
@@ -861,11 +869,20 @@ class ScrapeRunner:
                 # Log pages count before writing
                 pages_count = len(record.data.get("pages", {}))
                 gate_passed = record.data.get("gate_passed", False)
+                page_types = list(record.data.get("pages", {}).keys())
                 
                 if gate_passed:
-                    logger.debug(f"Flushing record nr={record.nr} gate_passed={gate_passed} pages_count={pages_count}")
+                    logger.info(
+                        f"[FLUSH] nr={record.nr} gate_passed={gate_passed} pages_count={pages_count} "
+                        f"page_types={page_types} -> Writing to Supabase..."
+                    )
                     if pages_count == 0:
                         logger.warning(f"Record nr={record.nr} has gate_passed=True but pages_count=0!")
+                    elif pages_count < 5:
+                        logger.warning(
+                            f"Record nr={record.nr} has gate_passed=True but only {pages_count}/5 pages! "
+                            f"Missing: {set(['view', 'payment', 'logistic', 'infos', 'orders']) - set(page_types)}"
+                        )
                 
                 try:
                     await self.writer.upsert_run_and_pages(
@@ -876,12 +893,17 @@ class ScrapeRunner:
                     # Mark as done only after successful Supabase write
                     successfully_written_nrs.append(record.nr)
                     await self.state_db.mark_done(record.nr)
-                    logger.debug(f"Successfully wrote record nr={record.nr} to Supabase")
+                    if gate_passed:
+                        logger.info(
+                            f"[SUCCESS] nr={record.nr} successfully written to Supabase with {pages_count} pages: {page_types}"
+                        )
+                    else:
+                        logger.debug(f"Successfully wrote record nr={record.nr} to Supabase (gate_passed=False)")
                 except Exception as e:
                     # Log error but continue with other records
                     failed_nrs.append(record.nr)
                     logger.error(
-                        f"Failed to write record nr={record.nr} to Supabase: {e}",
+                        f"[FAILED] Failed to write record nr={record.nr} to Supabase: {e}",
                         exc_info=True
                     )
                     # Don't mark as done - will be retried on next run

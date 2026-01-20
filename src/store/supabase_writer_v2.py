@@ -66,7 +66,15 @@ class SupabaseWriterV2:
         # Log pages being processed
         if gate_passed and pages:
             page_types = list(pages.keys())
-            logger.debug(f"Preparing {len(page_types)} pages for run_id={run_id} nr={record.nr}: {page_types}")
+            logger.info(
+                f"[SUPABASE_WRITE] run_id={run_id} nr={record.nr} gate_passed={gate_passed} "
+                f"Preparing {len(page_types)} pages: {page_types}"
+            )
+        elif gate_passed and not pages:
+            logger.warning(
+                f"[SUPABASE_WRITE] run_id={run_id} nr={record.nr} gate_passed={gate_passed} "
+                f"but NO PAGES to write!"
+            )
         
         for page_type, page_info in pages.items():
             if not isinstance(page_info, dict):
@@ -110,12 +118,17 @@ class SupabaseWriterV2:
                 None, self._upsert_sync, run_data, pages_data
             )
             if gate_passed and len(pages_data) == 0:
-                logger.warning(f"Upserted run {run_id} (nr={record.nr}) with gate_passed=True but 0 pages!")
+                logger.warning(
+                    f"[SUPABASE_WRITE] Upserted run {run_id} (nr={record.nr}) with gate_passed=True but 0 pages!"
+                )
             elif gate_passed:
                 page_types = [p.get("page_type") for p in pages_data]
-                logger.info(f"Upserted run {run_id} (nr={record.nr}) with {len(pages_data)} pages: {page_types}")
+                logger.info(
+                    f"[SUPABASE_WRITE] Successfully upserted run {run_id} (nr={record.nr}) "
+                    f"with {len(pages_data)} pages: {page_types}"
+                )
             else:
-                logger.debug(f"Upserted run {run_id} (nr={record.nr}) with gate_passed=False (no pages)")
+                logger.debug(f"[SUPABASE_WRITE] Upserted run {run_id} (nr={record.nr}) with gate_passed=False (no pages)")
         except Exception as e:
             logger.error(f"Supabase upsert error for run {run_id} (nr={record.nr}): {e}", exc_info=True)
             # Log error to errors table
@@ -182,12 +195,14 @@ class SupabaseWriterV2:
         # Log summary
         if failed_pages > 0:
             logger.warning(
-                f"Upserted {successful_pages}/{len(pages_data)} pages for run_id={run_id} nr={nr}. "
+                f"[SUPABASE_WRITE] Upserted {successful_pages}/{len(pages_data)} pages for run_id={run_id} nr={nr}. "
                 f"{failed_pages} pages failed."
             )
         elif len(pages_data) > 0:
-            logger.debug(
-                f"Successfully upserted all {len(pages_data)} pages for run_id={run_id} nr={nr}"
+            page_types_written = [p.get("page_type") for p in pages_data]
+            logger.info(
+                f"[SUPABASE_WRITE] Successfully upserted all {len(pages_data)} pages "
+                f"for run_id={run_id} nr={nr}: {page_types_written}"
             )
 
     async def log_error(
