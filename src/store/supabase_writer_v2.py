@@ -156,7 +156,30 @@ class SupabaseWriterV2:
         run_id = run_data.get("run_id")
         gate_passed = run_data.get("gate_passed", False)
         
-        # Upsert run
+        # CRITICAL: Before upserting a new run, delete old pages for this nr
+        # This prevents orphaned pages from previous runs when we overwrite cto_runs
+        # We only keep pages from the current run_id
+        try:
+            # Delete all pages for this nr that don't belong to the current run_id
+            # This ensures we don't accumulate pages from multiple runs
+            delete_response = (
+                self.client.table(self.pages_table)
+                .delete()
+                .eq("nr", nr)
+                .neq("run_id", run_id)  # Keep pages from current run_id only
+                .execute()
+            )
+            deleted_count = len(delete_response.data) if delete_response.data else 0
+            if deleted_count > 0:
+                logger.info(
+                    f"[SUPABASE_WRITE] Deleted {deleted_count} old pages for nr={nr} "
+                    f"(keeping run_id={run_id})"
+                )
+        except Exception as e:
+            # Log but don't fail - deletion is best effort to prevent orphaned pages
+            logger.warning(f"[SUPABASE_WRITE] Failed to delete old pages for nr={nr}: {e}")
+        
+        # Upsert run (this will overwrite previous run for this nr)
         try:
             (
                 self.client.table(self.runs_table)
