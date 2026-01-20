@@ -360,7 +360,7 @@ class ScrapeRunner:
 
             # Step 3: Gate passed - record and fetch all 5 pages
             self.run_control.record_gated()
-            logger.debug(f"Gate passed for nr {cto_nr}, fetching all pages")
+            logger.info(f"[GATE_PASSED] nr {cto_nr}: Gate PASSED, fetching all 5 pages...")
             urls = get_urls_for_nr(cto_nr)  # Returns list[str] of URLs (should be exactly 5)
             
             if self.dev_mode:
@@ -634,6 +634,16 @@ class ScrapeRunner:
                 f"Adding to buffer (buffer_size={len(self.batch_buffer) + 1}/{config.BATCH_SIZE})"
             )
             
+            # Log warning if pages count is unexpected
+            if pages_count == 0:
+                logger.error(f"[GATE_PASSED] nr {cto_nr}: ERROR - gate_passed=True but 0 pages parsed!")
+            elif pages_count < 5:
+                missing = set(['view', 'payment', 'logistic', 'infos', 'orders']) - set(page_types)
+                logger.warning(
+                    f"[GATE_PASSED] nr {cto_nr}: WARNING - Only {pages_count}/5 pages parsed! "
+                    f"Missing pages: {missing}"
+                )
+            
             # Add to buffer
             self.batch_buffer.append(record)
 
@@ -863,7 +873,7 @@ class ScrapeRunner:
             successfully_written_nrs = []
             failed_nrs = []
             
-            logger.info(f"Flushing {len(records)} records to Supabase (batch_id={self.batch_id})")
+            logger.info(f"[FLUSH_BUFFER] Flushing {len(records)} records to Supabase (batch_id={self.batch_id})")
             
             for record in records:
                 # Log pages count before writing
@@ -871,17 +881,20 @@ class ScrapeRunner:
                 gate_passed = record.data.get("gate_passed", False)
                 page_types = list(record.data.get("pages", {}).keys())
                 
+                # Always log record info, not just for gate_passed
+                logger.info(
+                    f"[FLUSH] nr={record.nr} gate_passed={gate_passed} pages_count={pages_count} "
+                    f"page_types={page_types} -> Writing to Supabase..."
+                )
+                
                 if gate_passed:
-                    logger.info(
-                        f"[FLUSH] nr={record.nr} gate_passed={gate_passed} pages_count={pages_count} "
-                        f"page_types={page_types} -> Writing to Supabase..."
-                    )
                     if pages_count == 0:
-                        logger.warning(f"Record nr={record.nr} has gate_passed=True but pages_count=0!")
+                        logger.error(f"[FLUSH] ERROR: Record nr={record.nr} has gate_passed=True but pages_count=0!")
                     elif pages_count < 5:
+                        missing = set(['view', 'payment', 'logistic', 'infos', 'orders']) - set(page_types)
                         logger.warning(
-                            f"Record nr={record.nr} has gate_passed=True but only {pages_count}/5 pages! "
-                            f"Missing: {set(['view', 'payment', 'logistic', 'infos', 'orders']) - set(page_types)}"
+                            f"[FLUSH] WARNING: Record nr={record.nr} has gate_passed=True but only {pages_count}/5 pages! "
+                            f"Missing: {missing}"
                         )
                 
                 try:
