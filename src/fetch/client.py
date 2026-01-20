@@ -1,4 +1,5 @@
 """HTTP client with retries and error handling."""
+import asyncio
 import logging
 from typing import Optional
 import httpx
@@ -122,14 +123,35 @@ class FetchClient:
             raise
 
     async def fetch_all(self, urls: list[str]) -> dict[str, Optional[httpx.Response]]:
-        """Fetch multiple URLs concurrently."""
-        tasks = {url: self.fetch(url) for url in urls}
+        """Fetch multiple URLs concurrently with retries."""
         results = {}
+        
+        # First attempt: fetch all URLs
+        tasks = {url: self.fetch(url) for url in urls}
         for url, task in tasks.items():
             try:
                 results[url] = await task
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                # Network errors: retry once
+                logger.warning(f"Network error for {url}, will retry: {e}")
+                results[url] = None
             except Exception as e:
+                # Other errors: log and mark as failed
                 logger.error(f"Failed to fetch {url}: {e}")
                 results[url] = None
+        
+        # Retry failed URLs once
+        failed_urls = [url for url, response in results.items() if response is None]
+        if failed_urls:
+            logger.info(f"Retrying {len(failed_urls)} failed URLs...")
+            await asyncio.sleep(1)  # Brief delay before retry
+            retry_tasks = {url: self.fetch(url) for url in failed_urls}
+            for url, task in retry_tasks.items():
+                try:
+                    results[url] = await task
+                except Exception as e:
+                    logger.error(f"Retry failed for {url}: {e}")
+                    results[url] = None
+        
         return results
 

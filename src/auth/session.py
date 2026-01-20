@@ -20,16 +20,36 @@ class SessionManager:
         self.cookie_only = cookie_only
         self.login_only = login_only
         self._relogin_failed = False
+        self._last_validation_time: float = 0.0
+        self._validation_cache_seconds: float = 30.0  # Cache validation for 30 seconds
 
     async def ensure_authenticated(self) -> None:
         """Ensure we have a valid session, login if needed."""
         if self._session_cookie:
-            # Verify session is still valid
-            if await self._is_session_valid():
+            # Only validate session periodically (not on every call) to reduce overhead
+            import time
+            time_since_validation = time.time() - self._last_validation_time
+            if time_since_validation < self._validation_cache_seconds:
+                # Use cached validation result
                 return
+            
+            # Verify session is still valid (with retry on network errors)
+            try:
+                if await self._is_session_valid():
+                    self._last_validation_time = time.time()
+                    return
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                # Network errors during validation don't mean session is invalid
+                # Just log and continue with existing session
+                logger.debug(f"Network error during session validation (assuming valid): {e}")
+                self._last_validation_time = time.time()
+                return
+            
             logger.warning("Session expired, re-authenticating...")
 
         await self.login()
+        import time
+        self._last_validation_time = time.time()
 
     async def check_and_relogin_if_needed(self, response: httpx.Response) -> bool:
         """
@@ -231,13 +251,13 @@ class SessionManager:
             return False
 
         try:
-            # Try to access a protected page
+            # Try to access a protected page with short timeout
             test_url = f"{config.BASE_URL}/digi/com/cto/view?nr=1"
             headers = {"Cookie": self._session_cookie}
             response = await self.client.get(
                 test_url,
                 headers=headers,
-                timeout=5,
+                timeout=5,  # Short timeout for validation
                 follow_redirects=False,
             )
 
@@ -249,11 +269,19 @@ class SessionManager:
 
             if response.status_code == 200:
                 text = response.text.lower()
+                # Check for login page indicators
                 if "se connecter" in text or "connexion" in text:
-                    return False
+                    # But don't fail if it's just mentioned in the page content
+                    # Only fail if it's clearly a login page (has login form)
+                    if "name=\"username\"" in text or "name=\"password\"" in text or "id=\"login\"" in text:
+                        return False
                 return True
 
             return False
+        except (httpx.TimeoutException, httpx.NetworkError) as e:
+            # Network errors don't mean session is invalid - re-raise to let caller handle
+            logger.debug(f"Network error during session validation: {e}")
+            raise
         except Exception as e:
             logger.debug(f"Session validation error: {e}")
             return False
