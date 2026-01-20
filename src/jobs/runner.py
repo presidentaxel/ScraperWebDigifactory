@@ -343,7 +343,6 @@ class ScrapeRunner:
                     )
                 
                 self.batch_buffer.append(record)
-                await self.state_db.mark_done(cto_nr)
                 self.metrics.increment("ok")
                 self.metrics.increment("processed")
                 self.metrics.increment("gate_failed")
@@ -352,6 +351,11 @@ class ScrapeRunner:
                 # Flush if needed
                 if len(self.batch_buffer) >= config.BATCH_SIZE:
                     await self._flush_buffer()
+                
+                # Mark as done only after successful flush (or if dry-run/no writer)
+                if self.dry_run or not self.writer:
+                    await self.state_db.mark_done(cto_nr)
+                # Otherwise, mark_done will be called in _flush_buffer after successful write
                 return
 
             # Step 3: Gate passed - record and fetch all 5 pages
@@ -589,8 +593,11 @@ class ScrapeRunner:
             if len(self.batch_buffer) >= config.BATCH_SIZE:
                 await self._flush_buffer()
 
-            # Mark as done (use cto_nr)
-            await self.state_db.mark_done(cto_nr)
+            # Mark as done only after successful flush (or if dry-run/no writer)
+            if self.dry_run or not self.writer:
+                await self.state_db.mark_done(cto_nr)
+            # Otherwise, mark_done will be called in _flush_buffer after successful write
+            
             self.metrics.increment("ok")
             self.metrics.increment("processed")
             self.metrics.increment("gate_passed")
@@ -798,26 +805,60 @@ class ScrapeRunner:
         if self.dry_run or not self.writer:
             if self.dev_mode:
                 logger.info(f"[DEV] Skipping Supabase write ({len(records)} records) - dry-run mode")
+            # Mark as done even in dry-run mode (since we're not writing to Supabase)
+            for record in records:
+                await self.state_db.mark_done(record.nr)
             return
 
         try:
             # Use new writer with 2-table schema
+            successfully_written_nrs = []
+            failed_nrs = []
+            
+            logger.info(f"Flushing {len(records)} records to Supabase (batch_id={self.batch_id})")
+            
             for record in records:
                 # Log pages count before writing
                 pages_count = len(record.data.get("pages", {}))
                 gate_passed = record.data.get("gate_passed", False)
+                
                 if gate_passed:
                     logger.debug(f"Flushing record nr={record.nr} gate_passed={gate_passed} pages_count={pages_count}")
                     if pages_count == 0:
                         logger.warning(f"Record nr={record.nr} has gate_passed=True but pages_count=0!")
                 
-                await self.writer.upsert_run_and_pages(
-                    self.run_id,
-                    record,
-                    max_html_bytes=self.max_html_bytes if self.store_html else None,
+                try:
+                    await self.writer.upsert_run_and_pages(
+                        self.run_id,
+                        record,
+                        max_html_bytes=self.max_html_bytes if self.store_html else None,
+                    )
+                    # Mark as done only after successful Supabase write
+                    successfully_written_nrs.append(record.nr)
+                    await self.state_db.mark_done(record.nr)
+                    logger.debug(f"Successfully wrote record nr={record.nr} to Supabase")
+                except Exception as e:
+                    # Log error but continue with other records
+                    failed_nrs.append(record.nr)
+                    logger.error(
+                        f"Failed to write record nr={record.nr} to Supabase: {e}",
+                        exc_info=True
+                    )
+                    # Don't mark as done - will be retried on next run
+            
+            # Log summary
+            if successfully_written_nrs:
+                logger.info(
+                    f"Batch {self.batch_id}: Successfully wrote {len(successfully_written_nrs)}/{len(records)} records "
+                    f"to Supabase. Success: {successfully_written_nrs[:10]}{'...' if len(successfully_written_nrs) > 10 else ''}"
                 )
-            # Delete spool file if it exists (from previous failed attempt)
-            await self.spool.delete_batch(self.batch_id)
+                await self.spool.delete_batch(self.batch_id)
+            
+            if failed_nrs:
+                logger.warning(
+                    f"Batch {self.batch_id}: Failed to write {len(failed_nrs)}/{len(records)} records "
+                    f"to Supabase. Failed: {failed_nrs[:10]}{'...' if len(failed_nrs) > 10 else ''}"
+                )
         except Exception as e:
             logger.warning(f"Supabase write failed, spooling to disk: {e}", exc_info=True)
             
