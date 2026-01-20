@@ -132,17 +132,22 @@ class ScrapeRunner:
 
         async def process_nr(nr: int) -> None:
             async with semaphore:
-                # Check stop conditions
-                should_stop, reason = self.run_control.should_stop()
-                if should_stop:
-                    logger.warning(f"Stop condition met: {reason}")
-                    return
-                await self._process_single_nr(nr)
-                
-                # Export metrics periodically
-                if time.time() - self.last_metrics_export > 30:  # Every 30 seconds
-                    await self._export_metrics()
-                    self.last_metrics_export = time.time()
+                try:
+                    # Check stop conditions
+                    should_stop, reason = self.run_control.should_stop()
+                    if should_stop:
+                        logger.warning(f"Stop condition met: {reason}")
+                        return
+                    await self._process_single_nr(nr)
+                    
+                    # Export metrics periodically
+                    if time.time() - self.last_metrics_export > 30:  # Every 30 seconds
+                        await self._export_metrics()
+                        self.last_metrics_export = time.time()
+                except Exception as e:
+                    # Log but don't re-raise - let gather handle it
+                    logger.error(f"Unexpected error in process_nr({nr}): {e}", exc_info=True)
+                    raise  # Re-raise so gather can catch it
 
         # Process with controlled concurrency
         chunk_size = 500
@@ -154,19 +159,47 @@ class ScrapeRunner:
                     logger.warning(f"Stop condition met before chunk: {reason}")
                     break
                 
-                chunk_nrs = nrs[i : i + chunk_size]
-                tasks = [process_nr(nr) for nr in chunk_nrs]
-                await asyncio.gather(*tasks, return_exceptions=True)
-                # Flush buffer after each chunk
-                await self._flush_buffer()
+                try:
+                    chunk_nrs = nrs[i : i + chunk_size]
+                    logger.debug(f"Processing chunk {i//chunk_size + 1}/{(len(nrs) + chunk_size - 1)//chunk_size} ({len(chunk_nrs)} records)")
+                    tasks = [process_nr(nr) for nr in chunk_nrs]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # Log any exceptions from tasks
+                    for idx, result in enumerate(results):
+                        if isinstance(result, Exception):
+                            logger.error(f"Task exception for nr {chunk_nrs[idx]}: {result}", exc_info=True)
+                    
+                    # Flush buffer after each chunk
+                    await self._flush_buffer()
+                except Exception as e:
+                    # Log but continue - don't let one chunk failure stop the whole run
+                    logger.error(f"Error processing chunk starting at index {i}: {e}", exc_info=True)
+                    # Still flush buffer in case we have partial data
+                    try:
+                        await self._flush_buffer()
+                    except Exception as flush_error:
+                        logger.error(f"Error flushing buffer after chunk error: {flush_error}", exc_info=True)
+                    # Continue to next chunk
+                    continue
         except KeyboardInterrupt:
-            logger.info("Interrupted by user")
+            logger.info("Interrupted by user (KeyboardInterrupt)")
+        except Exception as e:
+            # Catch any other unexpected exceptions
+            logger.error(f"Fatal error in run loop: {e}", exc_info=True)
+            logger.error("Attempting graceful shutdown...")
         finally:
             # Final flush
-            await self._flush_buffer()
+            try:
+                await self._flush_buffer()
+            except Exception as e:
+                logger.error(f"Error in final flush: {e}", exc_info=True)
             
             # Final report
-            await self._final_report()
+            try:
+                await self._final_report()
+            except Exception as e:
+                logger.error(f"Error generating final report: {e}", exc_info=True)
 
     async def _export_metrics(self) -> None:
         """Export current metrics."""

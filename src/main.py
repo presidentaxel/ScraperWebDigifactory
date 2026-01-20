@@ -302,10 +302,11 @@ def main() -> None:
     try:
         asyncio.run(runner.run())
     except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-        sys.exit(1)
+        logger.info("Interrupted by user (KeyboardInterrupt at main level)")
+        sys.exit(0)  # Exit code 0 = normal termination
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
+        logger.error(f"Fatal error in main: {e}", exc_info=True)
+        logger.error("This should not happen - please report this error")
         sys.exit(1)
 
 
